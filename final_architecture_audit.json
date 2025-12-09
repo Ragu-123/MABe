@@ -1,0 +1,391 @@
+{
+    "1_window_size_heuristic": {
+        "CRIM13": {
+            "recommended_window_size": 117,
+            "median_action_len": 32,
+            "architecture_type": "Transformer"
+        },
+        "DeliriousFly": {
+            "recommended_window_size": 172,
+            "median_action_len": 48,
+            "architecture_type": "Transformer"
+        },
+        "UppityFerret": {
+            "recommended_window_size": 55,
+            "median_action_len": 11,
+            "architecture_type": "Transformer"
+        },
+        "TranquilPanther": {
+            "recommended_window_size": 105,
+            "median_action_len": 27,
+            "architecture_type": "Transformer"
+        },
+        "LyricalHare": {
+            "recommended_window_size": 361,
+            "median_action_len": 86,
+            "architecture_type": "Transformer"
+        },
+        "ElegantMink": {
+            "recommended_window_size": 391,
+            "median_action_len": 68,
+            "architecture_type": "Transformer"
+        },
+        "CalMS21_supplemental": {
+            "recommended_window_size": 196,
+            "median_action_len": 28,
+            "architecture_type": "Transformer"
+        },
+        "SparklingTapir": {
+            "recommended_window_size": 252,
+            "median_action_len": 45,
+            "architecture_type": "Transformer"
+        },
+        "NiftyGoldfinch": {
+            "recommended_window_size": 78,
+            "median_action_len": 26,
+            "architecture_type": "Transformer"
+        },
+        "GroovyShrew": {
+            "recommended_window_size": 115,
+            "median_action_len": 33,
+            "architecture_type": "Transformer"
+        },
+        "BoisterousParrot": {
+            "recommended_window_size": 292,
+            "median_action_len": 113,
+            "architecture_type": "Transformer"
+        },
+        "AdaptableSnail": {
+            "recommended_window_size": 120,
+            "median_action_len": 39,
+            "architecture_type": "Transformer"
+        },
+        "CalMS21_task1": {
+            "recommended_window_size": 140,
+            "median_action_len": 31,
+            "architecture_type": "Transformer"
+        },
+        "PleasantMeerkat": {
+            "recommended_window_size": 9,
+            "median_action_len": 9,
+            "architecture_type": "Transformer"
+        },
+        "JovialSwallow": {
+            "recommended_window_size": 62,
+            "median_action_len": 20,
+            "architecture_type": "Transformer"
+        },
+        "InvincibleJellyfish": {
+            "recommended_window_size": 158,
+            "median_action_len": 41,
+            "architecture_type": "Transformer"
+        },
+        "CalMS21_task2": {
+            "recommended_window_size": 122,
+            "median_action_len": 29,
+            "architecture_type": "Transformer"
+        },
+        "ReflectiveManatee": {
+            "recommended_window_size": 97,
+            "median_action_len": 25,
+            "architecture_type": "Transformer"
+        },
+        "CautiousGiraffe": {
+            "recommended_window_size": 67,
+            "median_action_len": 26,
+            "architecture_type": "Transformer"
+        }
+    },
+    "2_logic_threshold_heuristic": {
+        "CRIM13": {
+            "avg_social_dist_px": 106.83,
+            "avg_nonsocial_dist_px": 170.91,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 207.95
+        },
+        "DeliriousFly": {
+            "avg_social_dist_px": 50.92,
+            "avg_nonsocial_dist_px": 270.0,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 97.31
+        },
+        "UppityFerret": {
+            "avg_social_dist_px": 108.91,
+            "avg_nonsocial_dist_px": 196.18,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 228.77
+        },
+        "TranquilPanther": {
+            "avg_social_dist_px": 70.05,
+            "avg_nonsocial_dist_px": 157.93,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 133.98
+        },
+        "LyricalHare": {
+            "avg_social_dist_px": 113.74,
+            "avg_nonsocial_dist_px": 144.21,
+            "distinguishability": "LOW",
+            "recommended_threshold_px": 198.8
+        },
+        "ElegantMink": {
+            "avg_social_dist_px": 58.74,
+            "avg_nonsocial_dist_px": 259.69,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 88.58
+        },
+        "CalMS21_supplemental": {
+            "avg_social_dist_px": 131.81,
+            "avg_nonsocial_dist_px": 248.35,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 206.05
+        },
+        "SparklingTapir": {
+            "avg_social_dist_px": 91.84,
+            "avg_nonsocial_dist_px": 364.07,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 281.6
+        },
+        "NiftyGoldfinch": {
+            "avg_social_dist_px": 153.88,
+            "avg_nonsocial_dist_px": 227.68,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 303.02
+        },
+        "GroovyShrew": {
+            "avg_social_dist_px": 149.14,
+            "avg_nonsocial_dist_px": 153.47,
+            "distinguishability": "LOW",
+            "recommended_threshold_px": 254.45
+        },
+        "BoisterousParrot": {
+            "avg_social_dist_px": 39.3,
+            "avg_nonsocial_dist_px": 120.58,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 50.93
+        },
+        "AdaptableSnail": {
+            "avg_social_dist_px": 513.01,
+            "avg_nonsocial_dist_px": 523.09,
+            "distinguishability": "LOW",
+            "recommended_threshold_px": 718.59
+        },
+        "CalMS21_task1": {
+            "avg_social_dist_px": 89.93,
+            "avg_nonsocial_dist_px": 330.87,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 154.32
+        },
+        "PleasantMeerkat": {
+            "avg_social_dist_px": 124.68,
+            "avg_nonsocial_dist_px": 1102.32,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 150.58
+        },
+        "JovialSwallow": {
+            "avg_social_dist_px": 61.6,
+            "avg_nonsocial_dist_px": 171.12,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 99.68
+        },
+        "InvincibleJellyfish": {
+            "avg_social_dist_px": 172.34,
+            "avg_nonsocial_dist_px": 451.86,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 249.33
+        },
+        "CalMS21_task2": {
+            "avg_social_dist_px": 104.99,
+            "avg_nonsocial_dist_px": 329.67,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 177.51
+        },
+        "ReflectiveManatee": {
+            "avg_social_dist_px": 69.85,
+            "avg_nonsocial_dist_px": 230.87,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 117.76
+        },
+        "CautiousGiraffe": {
+            "avg_social_dist_px": 98.24,
+            "avg_nonsocial_dist_px": 315.59,
+            "distinguishability": "HIGH",
+            "recommended_threshold_px": 119.97
+        }
+    },
+    "3_topology_check": {
+        "CRIM13": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "DeliriousFly": {
+            "tracked_nodes": 8,
+            "missing_canonical": [
+                "hip_left",
+                "neck",
+                "hip_right"
+            ]
+        },
+        "UppityFerret": {
+            "tracked_nodes": 14,
+            "missing_canonical": [
+                "neck"
+            ]
+        },
+        "TranquilPanther": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "LyricalHare": {
+            "tracked_nodes": 5,
+            "missing_canonical": [
+                "lateral_right",
+                "hip_right",
+                "body_center",
+                "lateral_left",
+                "hip_left",
+                "neck"
+            ]
+        },
+        "ElegantMink": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "CalMS21_supplemental": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "SparklingTapir": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "hip_left",
+                "tail_tip",
+                "neck",
+                "hip_right"
+            ]
+        },
+        "NiftyGoldfinch": {
+            "tracked_nodes": 5,
+            "missing_canonical": [
+                "lateral_right",
+                "hip_right",
+                "lateral_left",
+                "hip_left",
+                "neck",
+                "tail_tip"
+            ]
+        },
+        "GroovyShrew": {
+            "tracked_nodes": 4,
+            "missing_canonical": [
+                "lateral_right",
+                "hip_right",
+                "nose",
+                "body_center",
+                "lateral_left",
+                "hip_left",
+                "neck",
+                "tail_tip"
+            ]
+        },
+        "BoisterousParrot": {
+            "tracked_nodes": 5,
+            "missing_canonical": [
+                "lateral_right",
+                "hip_right",
+                "lateral_left",
+                "hip_left",
+                "neck",
+                "tail_tip"
+            ]
+        },
+        "AdaptableSnail": {
+            "tracked_nodes": 18,
+            "missing_canonical": [
+                "hip_left",
+                "hip_right"
+            ]
+        },
+        "CalMS21_task1": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "PleasantMeerkat": {
+            "tracked_nodes": 8,
+            "missing_canonical": [
+                "hip_left",
+                "neck",
+                "hip_right"
+            ]
+        },
+        "JovialSwallow": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "InvincibleJellyfish": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "CalMS21_task2": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        },
+        "ReflectiveManatee": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "hip_left",
+                "tail_tip",
+                "neck",
+                "hip_right"
+            ]
+        },
+        "CautiousGiraffe": {
+            "tracked_nodes": 7,
+            "missing_canonical": [
+                "body_center",
+                "lateral_right",
+                "lateral_left",
+                "tail_tip"
+            ]
+        }
+    }
+}

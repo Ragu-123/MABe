@@ -1,0 +1,159 @@
+{
+  "CRIM13": [
+    "approach",
+    "attack",
+    "disengage",
+    "mount",
+    "rear",
+    "selfgroom",
+    "sniff"
+  ],
+  "DeliriousFly": [
+    "attack",
+    "dominance",
+    "sniff"
+  ],
+  "UppityFerret": [
+    "huddle",
+    "reciprocalsniff",
+    "sniffgenital"
+  ],
+  "TranquilPanther": [
+    "intromit",
+    "mount",
+    "rear",
+    "selfgroom",
+    "sniff",
+    "sniffgenital"
+  ],
+  "LyricalHare": [
+    "approach",
+    "attack",
+    "defend",
+    "escape",
+    "freeze",
+    "rear",
+    "sniff"
+  ],
+  "ElegantMink": [
+    "allogroom",
+    "attack",
+    "attemptmount",
+    "ejaculate",
+    "intromit",
+    "mount",
+    "sniff"
+  ],
+  "CalMS21_supplemental": [
+    "approach",
+    "attack",
+    "attemptmount",
+    "dominancemount",
+    "intromit",
+    "mount",
+    "sniff",
+    "sniffbody",
+    "sniffface",
+    "sniffgenital"
+  ],
+  "SparklingTapir": [
+    "attack",
+    "defend",
+    "escape",
+    "mount"
+  ],
+  "NiftyGoldfinch": [
+    "approach",
+    "attack",
+    "biteobject",
+    "chase",
+    "climb",
+    "defend",
+    "dig",
+    "escape",
+    "exploreobject",
+    "flinch",
+    "follow",
+    "rear",
+    "selfgroom",
+    "sniff",
+    "sniffface",
+    "sniffgenital",
+    "tussle"
+  ],
+  "GroovyShrew": [
+    "approach",
+    "attemptmount",
+    "climb",
+    "defend",
+    "dig",
+    "escape",
+    "rear",
+    "rest",
+    "run",
+    "selfgroom",
+    "sniff",
+    "sniffgenital"
+  ],
+  "BoisterousParrot": [
+    "shepherd"
+  ],
+  "AdaptableSnail": [
+    "approach",
+    "attack",
+    "avoid",
+    "chase",
+    "chaseattack",
+    "rear",
+    "submit"
+  ],
+  "CalMS21_task1": [
+    "approach",
+    "attack",
+    "genitalgroom",
+    "intromit",
+    "mount",
+    "sniff",
+    "sniffbody",
+    "sniffface",
+    "sniffgenital"
+  ],
+  "PleasantMeerkat": [
+    "attack",
+    "chase",
+    "escape",
+    "follow"
+  ],
+  "JovialSwallow": [
+    "attack",
+    "chase",
+    "sniff"
+  ],
+  "InvincibleJellyfish": [
+    "allogroom",
+    "attack",
+    "dig",
+    "dominancegroom",
+    "escape",
+    "selfgroom",
+    "sniff",
+    "sniffgenital"
+  ],
+  "CalMS21_task2": [
+    "attack",
+    "mount",
+    "sniff"
+  ],
+  "ReflectiveManatee": [
+    "attack",
+    "sniff"
+  ],
+  "CautiousGiraffe": [
+    "chase",
+    "escape",
+    "reciprocalsniff",
+    "sniff",
+    "sniffbody",
+    "sniffgenital"
+  ]
+}
