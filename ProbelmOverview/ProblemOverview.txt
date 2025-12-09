@@ -1,0 +1,75 @@
+MABe Challenge - Social Action Recognition in Mice
+Detect unique behaviors from pose estimates of mice.
+
+
+MABe Challenge - Social Action Recognition in Mice
+
+Submit Prediction
+Overview
+In this competition, you’ll develop machine learning models to recognize behaviors in mice based on their movements, providing new insights into animal social structures and advancing behavioral science research.
+
+Start
+
+3 months ago
+Close
+6 days to go
+Merger & Entry
+Description
+Animal social behavior is complex. Species from ants to wolves to mice form social groups where they build nests, raise their young, care for their groupmates, and defend their territory. Studying these behaviors teaches us about the brain and the evolution of behavior, but the work has usually required subjective, time-consuming documenting of animals' actions. ML advancements now let us automate this process, supporting large-scale behavioral studies in the wild and in the lab.
+
+But even automated systems suffer from limited training data and poor generalizability. In current methods, an experimenter must hand-label hundreds of new training examples to automate recognition of a new behavior, which makes studying rare behaviors a challenge. And models trained within one research group usually fail when applied to data from other studies, meaning there is no guarantee that two labs are really studying the same behavior.
+
+This competition challenges you to build models to identify over 30 different social and non-social behaviors in pairs and groups of co-housed mice, based on markerless motion capture of their movements in top-down video recordings. The dataset includes over 400 hours of footage from 20+ behavioral recording systems, all carefully labeled frame-by-frame by experts. Your goal is to recognize these behaviors as accurately as a trained human observer while overcoming the inherent variability arising from the use of different data collection equipment and motion capture pipelines.
+
+Your work will help scientists automate behavior analysis and better understand animal social structures. These models may be deployed across numerous labs, in neuroscience, computational biology, ethology, and ecology, to create a foundation for future ML and behavior research.
+
+Evaluation
+This competition uses an F-Score variant as the metric. The F scores are averaged across each lab, each video, and score only the specific behaviors and mice that were annotated for a specific video. You may wish to review the full implementation here.
+
+Submission File
+You must create a row in the submission file for each discrete action. The file should contain a header and have the following format:
+
+row_id,video_id,agent_id,target_id,action,start_frame,stop_frame
+0,101686631,mouse1,mouse2,sniff,0,10
+1,101686631,mouse2,mouse1,sniff,15,16
+2,101686631,mouse1,mouse2,sniff,30,40
+3,101686631,mouse2,mouse1,sniff,55,65
+Timeline
+September 18, 2025 - Start Date.
+December 8, 2025 - Entry Deadline. You must accept the competition rules before this date in order to compete.
+December 8, 2025 - Team Merger Deadline. This is the last day participants may join or merge teams.
+December 15, 2025 - Final Submission Deadline.
+All deadlines are at 11:59 PM UTC on the corresponding day unless otherwise noted. The competition organizers reserve the right to update the contest timeline if they deem it necessary.
+
+Prizes
+First Prize: $20,000
+Second Prize: $10,000
+Third Prize: $8,000
+Fourth Prize: $7,000
+Fifth Prize: $5,000
+Code Requirements
+
+
+Submissions to this competition must be made through Notebooks. In order for the "Submit" button to be active after a commit, the following conditions must be met:
+
+CPU Notebook <= 9 hours run-time
+GPU Notebook <= 9 hours run-time
+Internet access disabled
+Freely & publicly available external data is allowed, including pre-trained models (note that we already provide formatted copies of most known external data, see below.)
+Submission file must be named submission.csv
+Please see the Code Competition FAQ for more information on how to submit. And review the code debugging doc if you are encountering submission errors.
+
+Previous Efforts and Benchmarks
+This competition builds on the Multi-Agent Behavior (MABe) Workshop and Competitions in 2021 and 2022, which focus on supervised and representation learning using data from multiple labs and organisms.
+
+Read the related papers on the 2021 and 2022 competitions:
+
+CalMS21 at NeurIPS (https://arxiv.org/pdf/2104.02710.pdf)
+MABe22 at ICML 2023 (https://arxiv.org/pdf/2207.10553.pdf)
+Read about another, earlier mouse behavior recognition dataset:
+
+CRIM13 at CVPR(doi: 10.1109/CVPR.2012.6247817)
+Note: for your convenience, we provide all pose and annotation files from CalMS21, MABe22, and CRIM13 as additional data in the competition training set.
+
+Citation
+Jennifer J. Sun, Markus Marks, Sam Golden, Talmo Pereira, Ann Kennedy, Sohier Dane, Addison Howard, and Ashley Chow. MABe Challenge - Social Action Recognition in Mice. https://kaggle.com/competitions/MABe-mouse-behavior-detection, 2025. Kaggle.
