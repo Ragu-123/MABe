@@ -1063,15 +1063,8 @@ def train_ethoswarm_v3():
     # Load Masks
     lab_masks = load_lab_vocabulary(VOCAB_PATH, ACTION_TO_IDX, NUM_CLASSES, DEVICE)
     
-    self_indices = [ACTION_TO_IDX[a] for a in sorted(
-        ["biteobject", "climb", "dig", "exploreobject", "freeze", "genitalgroom", 
-         "huddle", "rear", "rest", "run", "selfgroom"])]
-    pair_indices = [ACTION_TO_IDX[a] for a in sorted(
-        ["allogroom", "approach", "attack", "attemptmount", "avoid", "chase", 
-         "chaseattack", "defend", "disengage", "dominance", "dominancegroom", 
-         "dominancemount", "ejaculate", "escape", "flinch", "follow", "intromit", 
-         "mount", "reciprocalsniff", "shepherd", "sniff", "sniffbody", "sniffface", 
-         "sniffgenital", "submit", "tussle"])]
+    self_indices = [ACTION_TO_IDX[a] for a in SELF_BEHAVIORS]
+    pair_indices = [ACTION_TO_IDX[a] for a in PAIR_BEHAVIORS]
          
     loss_fn = DualStreamMaskedFocalLoss(self_indices, pair_indices, gamma=2.0)
 
