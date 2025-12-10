@@ -769,6 +769,10 @@ class MultiTaskLogicHead(nn.Module):
 
 # Module 6: Final Assembly (EthoSwarmNet V4 - Enhanced)
 
+# BEHAVIOR DEFINITIONS
+SELF_BEHAVIORS = sorted(["biteobject", "climb", "dig", "exploreobject", "freeze", "genitalgroom", "huddle", "rear", "rest", "run", "selfgroom"])
+PAIR_BEHAVIORS = sorted(["allogroom", "approach", "attack", "attemptmount", "avoid", "chase", "chaseattack", "defend", "disengage", "dominance", "dominancegroom", "dominancemount", "ejaculate", "escape", "flinch", "follow", "intromit", "mount", "reciprocalsniff", "shepherd", "sniff", "sniffbody", "sniffface", "sniffgenital", "submit", "tussle"])
+
 class EthoSwarmNet(nn.Module):
     def __init__(self, num_classes=37, input_dim=128):
         super(EthoSwarmNet, self).__init__()
