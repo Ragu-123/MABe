@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import math
+import random
+import polars as pl
 
 # ==============================================================================
 # 1. SHARED CONFIGURATION & DATA (Copied exactly from train.py)
@@ -51,6 +53,7 @@ BODY_PARTS = [
     "lateral_left", "lateral_right", "hip_left", "hip_right",
     "tail_base", "tail_tip"
 ]
+PART_TO_IDX = {p: i for i, p in enumerate(BODY_PARTS)}
 
 class BioPhysicsDataset(Dataset):
     def __init__(self, data_root, mode='test', video_ids=None):
@@ -58,20 +61,28 @@ class BioPhysicsDataset(Dataset):
         self.mode = mode
         self.tracking_dir = self.root / f"{mode}_tracking"
 
-        # Load Metadata
         self.metadata = pd.read_csv(self.root / f"{mode}.csv")
-
-        # Filter Video IDs
         if video_ids is not None:
             self.metadata = self.metadata[self.metadata['video_id'].astype(str).isin(video_ids)]
 
-        # Build samples strictly from metadata to ensure processing order
         self.samples = []
+        default_mice = ['mouse1', 'mouse2']
+
+        print(f"Building samples for {len(self.metadata)} videos (Optimized)...")
         for _, row in self.metadata.iterrows():
-            self.samples.append({
-                'video_id': str(row['video_id']),
-                'lab_id': row['lab_id']
-            })
+            vid = str(row['video_id'])
+            lab = row['lab_id']
+            mice = default_mice
+
+            for agent in mice:
+                for target in mice:
+                    if agent != target:
+                        self.samples.append({
+                            'video_id': vid,
+                            'lab_id': lab,
+                            'agent_id': agent,
+                            'target_id': target
+                        })
 
     def _fix_teleport(self, pos):
         T, N, _ = pos.shape
@@ -106,7 +117,6 @@ class BioPhysicsDataset(Dataset):
         # Apply to Agent
         x = centered[..., 0]
         y = centered[..., 1]
-
         c_exp = c[:, None]
         s_exp = s[:, None]
 
@@ -117,86 +127,90 @@ class BioPhysicsDataset(Dataset):
         # Apply to Target
         x_o = other_centered[..., 0]
         y_o = other_centered[..., 1]
-
         other_rot_x = x_o * c_exp - y_o * s_exp
         other_rot_y = x_o * s_exp + y_o * c_exp
         other_centered = np.stack([other_rot_x, other_rot_y], axis=-1)
 
-        # 4. Velocity (computed on Rotated & Centered coords)
+        # 4. Dynamics
         vel = np.diff(centered, axis=0, prepend=centered[0:1])
         speed = np.sqrt((vel**2).sum(axis=-1))
+        acc = np.diff(vel, axis=0, prepend=vel[0:1])
 
         # 5. Relation
         dist = np.sqrt(((centered - other_centered)**2).sum(axis=-1))
 
+        # Pack to 8 Channels
         feat = np.stack([
             centered[...,0], centered[...,1],
             vel[...,0], vel[...,1],
             speed, dist,
-            np.zeros_like(speed), np.zeros_like(speed),
-            np.zeros_like(speed), np.zeros_like(speed),
-            np.zeros_like(speed), np.zeros_like(speed),
-            np.zeros_like(speed), np.zeros_like(speed),
-            np.zeros_like(speed), np.zeros_like(speed),
+            acc[...,0], acc[...,1]
         ], axis=-1)
 
         return feat.astype(np.float32)
 
-    def load_full_video_features(self, idx):
+    def load_full_video_features_for_pair(self, idx):
         """
-        Loads the FULL video features for sliding window inference.
-        Returns: (feats, lab_idx, agent_id, target_id)
+        Loads the FULL video features for sliding window inference for a SPECIFIC pair.
+        Returns: (feats, lab_idx, agent_id, target_id, frames)
         """
         sample = self.samples[idx]
         lab = sample['lab_id']
         vid = sample['video_id']
+        agent_id = sample['agent_id']
+        target_id = sample['target_id']
         conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
         if not fpath.exists():
-            return None, None, None, None
+            return None, None, None, None, None
 
         try:
-            df = pd.read_parquet(fpath)
-            mids = df['mouse_id'].unique()
+            # Optimized Load with Polars
+            q = pl.scan_parquet(fpath).filter(
+                pl.col("mouse_id").is_in([agent_id, target_id])
+            )
+            df = q.collect().to_pandas()
 
-            # Identify Agents
-            m1_id = mids[0]
-            m2_id = mids[1] if len(mids) > 1 else m1_id # Handle single mouse case
+            if df.empty:
+                return None, None, None, None, None
 
-            L = len(df) // len(mids) # approx length
-            # Better way: get max frame
-            # Or just filter by mouse
+            # Align indices based on frames found
+            common_frames = sorted(df['frame'].unique())
 
-            d1_full = df[df['mouse_id']==m1_id]
-            d2_full = df[df['mouse_id']==m2_id]
+            # Reindex to full range?
+            # Or just use the common frames?
+            # For inference, we need continuous timeline if possible, or we predict on existing frames.
+            # Let's trust the 'frame' column.
 
-            # Pivot to [T, 11, 2]
-            # Assumes 'bodypart' column exists
-            # We need to ensure frames are aligned.
-            # Reindex by frame.
+            # Efficient Pivot/Reshape
+            # Since 'frame' is common, we can assume L frames.
+            # But frames might be missing.
+            # Reindex to min-max range
+            min_f = common_frames[0]
+            max_f = common_frames[-1]
+            L = max_f - min_f + 1
 
-            # Simple Pivot
-            # (In production, use Polars or optimized pandas pivot)
-            p1 = d1_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
-            p2 = d2_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
+            # Map frames relative to min_f
+            df['frame_idx'] = (df['frame'] - min_f).astype(int)
+            df['bp_idx'] = df['bodypart'].map(PART_TO_IDX)
+            df = df.dropna(subset=['bp_idx'])
+            df['bp_idx'] = df['bp_idx'].astype(int)
 
-            # Align indices
-            common_index = p1.index.union(p2.index).sort_values()
-            p1 = p1.reindex(common_index).fillna(method='ffill').fillna(0)
-            p2 = p2.reindex(common_index).fillna(method='ffill').fillna(0)
+            raw_m1 = np.zeros((L, 11, 2), dtype=np.float32)
+            raw_m2 = np.zeros((L, 11, 2), dtype=np.float32)
 
-            raw_m1 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
-            raw_m2 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
+            df_a = df[df['mouse_id'] == agent_id]
+            df_t = df[df['mouse_id'] == target_id]
 
-            for i, bp in enumerate(BODY_PARTS):
-                if ('x', bp) in p1.columns:
-                    raw_m1[:, i, 0] = p1[('x', bp)].values
-                    raw_m1[:, i, 1] = p1[('y', bp)].values
-                if ('x', bp) in p2.columns:
-                    raw_m2[:, i, 0] = p2[('x', bp)].values
-                    raw_m2[:, i, 1] = p2[('y', bp)].values
+            if not df_a.empty:
+                raw_m1[df_a['frame_idx'], df_a['bp_idx'], 0] = df_a['x'].values
+                raw_m1[df_a['frame_idx'], df_a['bp_idx'], 1] = df_a['y'].values
+
+            if not df_t.empty:
+                raw_m2[df_t['frame_idx'], df_t['bp_idx'], 0] = df_t['x'].values
+                raw_m2[df_t['frame_idx'], df_t['bp_idx'], 1] = df_t['y'].values
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)
@@ -207,11 +221,14 @@ class BioPhysicsDataset(Dataset):
 
             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
-            return torch.tensor(feats), lab_idx, m1_id, m2_id, common_index.values
+            # Return original frames for submission mapping
+            frame_map = np.arange(min_f, max_f + 1)
+
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frame_map
 
         except Exception as e:
-            print(f"Error loading {vid}: {e}")
-            return None, None, None, None
+            # print(f"Error loading {vid}: {e}")
+            return None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -220,7 +237,7 @@ class BioPhysicsDataset(Dataset):
 # ==============================================================================
 # (Pasting the V4 Architecture here)
 class CanonicalGraphAdapter(nn.Module):
-    def __init__(self, input_nodes=11, canonical_nodes=11, feat_dim=16, num_labs=20):
+    def __init__(self, input_nodes=11, canonical_nodes=11, feat_dim=8, num_labs=20):
         super().__init__()
         self.projection = nn.Parameter(torch.eye(input_nodes).unsqueeze(0).repeat(num_labs, 1, 1))
         self.projection.data += torch.randn_like(self.projection) * 0.01
@@ -240,7 +257,7 @@ class CanonicalGraphAdapter(nn.Module):
         return self.refine(out)
 
 class SocialInteractionBlock(nn.Module):
-    def __init__(self, node_dim=16, hidden_dim=64):
+    def __init__(self, node_dim=8, hidden_dim=64):
         super().__init__()
         self.attention = nn.MultiheadAttention(embed_dim=node_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(node_dim)
@@ -258,9 +275,9 @@ class SocialInteractionBlock(nn.Module):
 class MorphologicalInteractionCore(nn.Module):
     def __init__(self, num_labs=20):
         super().__init__()
-        self.adapter = CanonicalGraphAdapter(input_nodes=11, canonical_nodes=11, num_labs=num_labs)
-        self.interaction = SocialInteractionBlock()
-        self.frame_fusion = nn.Linear(384, 128)
+        self.adapter = CanonicalGraphAdapter(input_nodes=11, canonical_nodes=11, feat_dim=8, num_labs=num_labs)
+        self.interaction = SocialInteractionBlock(node_dim=8)
+        self.frame_fusion = nn.Linear(208, 128) # 11*8*2 + 32
     def forward(self, agent_x, target_x, lab_idx):
         a_c = self.adapter(agent_x, lab_idx)
         t_c = self.adapter(target_x, lab_idx)
@@ -273,7 +290,7 @@ class MorphologicalInteractionCore(nn.Module):
         return out, a_c, t_c
 
 class SplitStreamInteractionBlock(nn.Module):
-    def __init__(self, node_dim=16, hidden_dim=128):
+    def __init__(self, node_dim=8, hidden_dim=128):
         super().__init__()
         self.self_input_size = 11 * 4
         self.self_projector = nn.Sequential(nn.Linear(self.self_input_size, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
@@ -289,6 +306,7 @@ class SplitStreamInteractionBlock(nn.Module):
         self_feat = self.self_projector(agent_flat_self)
         agent_flat_full = agent_c.view(batch, time, -1)
         target_flat_full = target_c.view(batch, time, -1)
+        # Use mean of dist(5) and speed(4) roughly
         rel_feats = agent_c[..., 4:7].mean(dim=2)
         rel_embed = self.relational_mlp(rel_feats)
         if role_indices is None:
@@ -321,6 +339,7 @@ class LocalGlobalChronosEncoder(nn.Module):
         self.pos_encoder = PositionalEncoding(hidden_dim, max_len=5000)
         global_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, dim_feedforward=512, batch_first=True, dropout=0.1, activation="gelu")
         self.global_transformer = nn.TransformerEncoder(global_layer, num_layers=2)
+        self.global_classifier = nn.Linear(hidden_dim, 37)
 
         self.self_tcn = nn.Sequential(
             nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1), nn.BatchNorm1d(hidden_dim), nn.GELU(),
@@ -345,6 +364,8 @@ class LocalGlobalChronosEncoder(nn.Module):
         g_emb = self.pos_encoder(g_emb)
         global_memory = self.global_transformer(g_emb)
 
+        g_logits = self.global_classifier(global_memory)
+
         s_in = local_self.permute(0, 2, 1)
         s_tcn = self.self_tcn(s_in).permute(0, 2, 1)
         s_tcn = self.self_local_attn(s_tcn)
@@ -357,7 +378,7 @@ class LocalGlobalChronosEncoder(nn.Module):
         p_ctx, _ = self.pair_attn(query=p_tcn, key=global_memory, value=global_memory)
         pair_out = self.pair_norm(p_tcn + p_ctx)
 
-        return self_out, pair_out
+        return self_out, pair_out, g_logits
 
 class MultiTaskLogicHead(nn.Module):
     def __init__(self, input_dim=128, num_labs=20):
@@ -369,6 +390,11 @@ class MultiTaskLogicHead(nn.Module):
         self.pair_classifier = nn.Sequential(nn.Linear(fusion_dim, expanded_dim), nn.LayerNorm(expanded_dim), nn.GELU(), nn.Linear(expanded_dim, 26))
         self.center_regressor = nn.Sequential(nn.Linear(fusion_dim, 64), nn.GELU(), nn.Linear(64, 1))
         self.gate_control = nn.Linear(1, 1)
+        with torch.no_grad():
+            self.gate_control.bias.fill_(2.0)
+            nn.init.constant_(self.self_classifier[3].bias, -4.59)
+            nn.init.constant_(self.pair_classifier[3].bias, -4.59)
+            nn.init.constant_(self.center_regressor[2].bias, 0.0)
 
     def forward(self, self_feat, pair_feat, lab_idx, agent_c, target_c):
         batch, time, _ = self_feat.shape
@@ -392,9 +418,9 @@ PAIR_BEHAVIORS = sorted(["allogroom", "approach", "attack", "attemptmount", "avo
 
 class EthoSwarmNet(nn.Module):
     def __init__(self, num_classes=37, input_dim=128):
-        super().__init__()
+        super(EthoSwarmNet, self).__init__()
         self.morph_core = MorphologicalInteractionCore(num_labs=20)
-        self.split_interaction = SplitStreamInteractionBlock(hidden_dim=128)
+        self.split_interaction = SplitStreamInteractionBlock(hidden_dim=128, node_dim=8)
         self.chronos = LocalGlobalChronosEncoder(input_dim=128, hidden_dim=128)
         self.logic_head = MultiTaskLogicHead(input_dim=128, num_labs=20)
         self.register_buffer('self_indices', self._get_indices(SELF_BEHAVIORS))
@@ -410,13 +436,14 @@ class EthoSwarmNet(nn.Module):
         g_out, _, _ = self.morph_core(global_agent, global_target, lab_idx)
         _, l_ac, l_tc = self.morph_core(local_agent, local_target, lab_idx)
         l_self, l_pair = self.split_interaction(l_ac, l_tc, role_indices=role_idx)
-        t_self, t_pair = self.chronos(g_out, l_self, l_pair)
-        p_self, p_pair, _ = self.logic_head(t_self, t_pair, lab_idx, l_ac, l_tc)
+        t_self, t_pair, g_logits = self.chronos(g_out, l_self, l_pair)
+        p_self, p_pair, center_score = self.logic_head(t_self, t_pair, lab_idx, l_ac, l_tc)
         batch, time, _ = p_self.shape
         final_output = torch.zeros(batch, time, 37, device=p_self.device, dtype=p_self.dtype)
         final_output.index_copy_(2, self.self_indices, p_self)
         final_output.index_copy_(2, self.pair_indices, p_pair)
-        return final_output
+        g_logits_up = F.interpolate(g_logits.permute(0,2,1), size=time, mode='linear').permute(0,2,1)
+        return final_output, center_score, g_logits_up
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
@@ -431,7 +458,6 @@ def run_inference():
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 1. Load Thresholds
     thresholds = torch.ones(37).to(DEVICE) * 0.4
     if os.path.exists("thresholds.json"):
         with open("thresholds.json", "r") as f:
@@ -439,11 +465,9 @@ def run_inference():
             thresholds = torch.tensor(th_list).to(DEVICE)
         print("Loaded Optimized Thresholds.")
 
-    # 2. Load Model
-    model = EthoSwarmNet(num_classes=NUM_CLASSES)
+    model = EthoSwarmNet(num_classes=NUM_CLASSES, input_dim=8) # 8 dim input
     model.to(DEVICE)
 
-    # Load Weights (Latest)
     weights = sorted([f for f in os.listdir(".") if f.startswith("ethoswarm_v4_ep")])
     if weights:
         print(f"Loading weights: {weights[-1]}")
@@ -453,154 +477,66 @@ def run_inference():
         print("No weights found! Inference will be random.")
 
     model.eval()
-
-    # 3. Data
     ds = BioPhysicsDataset(DATA_PATH, 'test')
 
-    # 4. Processing Loop
     submission_rows = []
-
     WINDOW_SIZE = 256
     STRIDE = 128
 
     print(f"Starting Inference on {len(ds)} samples...")
     for i in range(len(ds)):
-        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features(i)
+        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features_for_pair(i)
 
         if feats is None: continue
 
-        # Prepare Tensors
-        # feats: [Total_Frames, 11, 16]
         T_total = len(feats)
-
-        # Accumulators for blending
-        # [T_total, 37]
         prob_accum = torch.zeros((T_total, 37), device=DEVICE)
         count_accum = torch.zeros((T_total, 37), device=DEVICE)
 
-        # Sliding Window
-        # We need batches for speed? Or just loop over chunks?
-        # Loop chunks is safer for memory.
-
-        for start in range(0, T_total, STRIDE):
-            end = min(start + WINDOW_SIZE, T_total)
-            length = end - start
-
-            # Slice
-            chunk = feats[start:end].unsqueeze(0).to(DEVICE) # [1, L, 11, 16]
-
-            # Pad if needed (must be at least window size for TCN padding?)
-            # Actually TCN uses 'same' padding logic usually, but let's check.
-            # Our TCN has padding=1/2/4/8/16. Max dilation 16.
-            # Min length needed is small, but let's pad to be safe if very short.
-
-            # Forward
-            with torch.no_grad():
-                # Global Context: Downsample to 1 FPS (approx every 30 frames)
-                # chunk shape [1, L, 11, 16]
-                # Global needs [1, T_g, 128] ? No, Global takes feats?
-                # Wait, train loop passed 'gx' (raw feats) to model.
-                # Model expects (gx, gx, lx, lx, lid).
-
-                # Global Feats: We should pass the whole chunk as "global" for itself?
-                # Ideally Global Context is the *whole video*.
-                # But whole video fits in memory?
-                # feats is [T_total, 11, 16].
-                # If T=30,000, 11*16*30000 * 4 bytes ~ 20MB. Fits easily.
-
-                # Strategy:
-                # 1. Compute Global Context for WHOLE video ONCE.
-                # 2. Pass window for Local.
-
-                pass
-
-        # REVISED STRATEGY FOR SPEED/ACCURACY
-        # 1. Compute Global Embedding for entire video (subsampled)
-        g_feats_full = feats.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
-
-        # Subsample for Global Stream (every 30th frame ~ 1FPS)
+        g_feats_full = feats.unsqueeze(0).to(DEVICE)
         g_input = g_feats_full[:, ::30, :, :]
-        if g_input.shape[1] == 0: g_input = g_feats_full # Fallback short video
+        if g_input.shape[1] == 0: g_input = g_feats_full
 
-        # 2. Loop Windows for Local
         for start in range(0, T_total, STRIDE):
             end = min(start + WINDOW_SIZE, T_total)
-
             l_input = g_feats_full[:, start:end, :, :]
             lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
-
             with torch.no_grad():
-                 probs = model(g_input, g_input, l_input, l_input, lid_tensor)
-                 # probs: [1, L, 37]
-
+                 probs, _, _ = model(g_input, g_input, l_input, l_input, lid_tensor)
             prob_accum[start:end] += probs[0]
             count_accum[start:end] += 1.0
 
-        # Average
         final_probs = prob_accum / (count_accum + 1e-6)
-
-        # Thresholding
-        # Apply per-class thresholds
         preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
-
-        # Generate Submission Rows
-        # Format: video_id, agent, target, action, start, end
-        # RLE Encoding
+        vid = ds.samples[i]['video_id']
 
         for c in range(37):
             action_name = ACTION_LIST[c]
             binary_seq = preds[:, c]
-
-            # RLE
             diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
             starts = np.where(diffs == 1)[0]
             stops = np.where(diffs == -1)[0]
 
             for s, e in zip(starts, stops):
-                # Apply Frame Index
                 real_start = frames[s]
-                real_stop = frames[e-1] # inclusive?
-                # Competition: start_frame, stop_frame
-
-                # Resolve Target ID
-                # If action is 'Self', target is 'self' (implied?)
-                # Actually submission requires explicit target ID usually.
-                # Reference: "mouse1", "self" or "mouse2".
-
-                # Check if pair behavior
+                real_stop = frames[e-1]
                 final_target = target_id
                 if action_name in SELF_BEHAVIORS:
-                    final_target = 'self' # Or 'self'? Check format.
-                    # Reference used "self" string.
+                    final_target = 'self'
                 else:
-                    # Pair behavior
-                    # If target_id is same as agent_id (single mouse?), this logic fails.
-                    if target_id == agent_id: final_target = 'self' # Should not happen in pair
+                    if target_id == agent_id: final_target = 'self'
 
-                # Format: "mouse1", "mouse2"
-                ag_str = f"mouse{agent_id}"
+                ag_str = f"mouse{agent_id}" if isinstance(agent_id, int) else agent_id
                 if final_target == 'self':
                     tg_str = 'self'
                 else:
-                    tg_str = f"mouse{final_target}"
+                    tg_str = f"mouse{final_target}" if isinstance(final_target, int) else final_target
 
-                submission_rows.append([
-                     i, # Row ID placeholder
-                     vid,
-                     ag_str,
-                     tg_str,
-                     action_name,
-                     real_start,
-                     real_stop
-                ])
+                submission_rows.append([0, vid, ag_str, tg_str, action_name, real_start, real_stop])
 
-    # Create DF
     df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
-
-    # Sort and re-index
     df_sub = df_sub.sort_values(['video_id', 'start_frame'])
     df_sub['row_id'] = np.arange(len(df_sub))
-
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
 
