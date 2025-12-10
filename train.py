@@ -7,6 +7,14 @@ import numpy as np
 from pathlib import Path
 import ast
 import random
+import os
+import json
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+import math
 
 # --- CONFIGURATION ---
 LAB_CONFIGS = {
@@ -117,22 +125,58 @@ class BioPhysicsDataset(Dataset):
         return cleaned
 
     def _geo_feats(self, pos, other, pix_cm):
-        # Simple geometric extractor
-        # Normalize
+        # Simple geometric extractor with EGO-ROTATION
+
+        # 1. Normalize
         pos = pos / pix_cm
         other = other / pix_cm
         
-        # Align
-        origin = pos[:, 9:10, :] # Tail base
+        # 2. Centering (Relative to Tail Base)
+        # TailBase is index 9
+        origin = pos[:, 9:10, :]
         centered = pos - origin
         other_centered = other - origin
         
-        # Velocity
+        # 3. ROTATION (Face East)
+        # Vector from TailBase(9) to Neck(3)
+        # Neck is index 3. TailBase is 0,0 after centering.
+        spine = centered[:, 3, :] # [T, 2]
+        # Calculate angle
+        angles = np.arctan2(spine[:, 1], spine[:, 0]) # [T]
+
+        # Rotation Matrix components for rotating by -angle
+        c = np.cos(-angles)
+        s = np.sin(-angles)
+
+        # Apply to Agent [T, 11, 2]
+        # x' = x*c - y*s
+        # y' = x*s + y*c
+        x = centered[..., 0]
+        y = centered[..., 1]
+
+        # Broadcast c, s from [T] to [T, 11]
+        c_exp = c[:, None]
+        s_exp = s[:, None]
+
+        centered_rot_x = x * c_exp - y * s_exp
+        centered_rot_y = x * s_exp + y * c_exp
+        centered = np.stack([centered_rot_x, centered_rot_y], axis=-1)
+
+        # Apply to Target
+        x_o = other_centered[..., 0]
+        y_o = other_centered[..., 1]
+
+        other_rot_x = x_o * c_exp - y_o * s_exp
+        other_rot_y = x_o * s_exp + y_o * c_exp
+        other_centered = np.stack([other_rot_x, other_rot_y], axis=-1)
+
+        # 4. Velocity (computed on Rotated & Centered coords)
+        # This ensures velocity is also relative to body orientation (Surge/Sway)
         vel = np.diff(centered, axis=0, prepend=centered[0:1])
         speed = np.sqrt((vel**2).sum(axis=-1))
         
-        # Relation
-        dist = np.sqrt(((pos - other)**2).sum(axis=-1))
+        # 5. Relation
+        dist = np.sqrt(((centered - other_centered)**2).sum(axis=-1))
         
         # Pack to 16
         # [Pos X, Pos Y, Vel X, Vel Y, Speed, Rel_Dist] + Pads
@@ -255,9 +299,6 @@ def pad_collate_dual(batch):
     return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid)
 
 # Module 2: The Morphological & Interaction Core.
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 # ==============================================================================
 # 1. CANONICAL GRAPH ADAPTER (Signal Refinement)
@@ -314,55 +355,49 @@ class CanonicalGraphAdapter(nn.Module):
         return out # (Batch, Time, 11, 16)
 
 # ==============================================================================
-# 2. SOCIAL INTERACTION BLOCK (Updated for Geo-Features)
+# 2. SOCIAL INTERACTION BLOCK (Upgraded to Graph Attention)
 # ==============================================================================
 class SocialInteractionBlock(nn.Module):
     def __init__(self, node_dim=16, hidden_dim=64):
         super().__init__()
 
-        # Relational MLP
-        # Takes the pre-calc geometric relations from Module 1
-        # [Rel_X, Rel_Y, Rel_Dist] + [Speed_Self, Speed_Other] (Derived)
-        self.relational_mlp = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.GELU(),
-            nn.Linear(32, 16)
-        )
+        # Graph Attention Network (GAT)
+        # Queries: Agent Nodes, Keys/Values: Target Nodes
+        self.attention = nn.MultiheadAttention(embed_dim=node_dim, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(node_dim)
 
-        self.fusion = nn.Linear(node_dim * 2 + 16, hidden_dim)
+        # Relational MLP (Post-Attention)
+        self.relational_mlp = nn.Sequential(
+            nn.Linear(node_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 32)
+        )
 
     def forward(self, agent_canon, target_canon):
         # Input: [B, T, 11, 16] (Normalized Egocentric Features)
+        b, t, n, f = agent_canon.shape
         
-        # New Feature Map (Module 1):
-        # 0: PosX, 1: PosY (Self)
-        # 2: VelX, 3: VelY
-        # 4: Neighbor PosX, 5: Neighbor PosY (Explicit Relation)
-        # 6: Neighbor Dist
+        # Flatten Time for Batch processing
+        a_flat = agent_canon.view(b*t, n, f)
+        t_flat = target_canon.view(b*t, n, f)
         
-        # We extract Interaction Context from Node 0 (Body/Nose or Main Axis)
-        # or aggregate across nodes. Here we take the mean interaction 
-        # features across all nodes for stability.
+        # Attention: How much does each part of 'Agent' care about 'Target' parts?
+        attn_out, _ = self.attention(query=a_flat, key=t_flat, value=t_flat)
         
-        # 1. Extract Interaction Features (Ch 4, 5, 6)
-        # Shape: [B, T, 3] (Mean over nodes)
-        interaction_raw = agent_canon[..., 4:7].mean(dim=2) 
+        # Residual + Norm
+        # This creates "Contextualized Agent" features enriched with Target info
+        interact_ctx = self.norm(a_flat + attn_out) # [B*T, 11, 16]
         
-        # 2. Extract Dynamic Differences
-        # Speed is typically computed in loader, but let's take velocity diffs (Ch 2,3)
-        # Vel Self (Ch 2,3)
-        vel_self = agent_canon[..., 2:4].mean(dim=2) 
-        # Vel Other (Inferred/Proxy via target tensor)
-        vel_targ = target_canon[..., 2:4].mean(dim=2)
+        # Aggregate Interaction (Pool over nodes)
+        # We concat Original + Interaction Context
+        combined = torch.cat([a_flat, interact_ctx], dim=-1) # [B*T, 11, 32]
+        interact_summ = combined.mean(dim=1) # [B*T, 32]
         
-        speed_diff = torch.norm(vel_self - vel_targ, dim=-1, keepdim=True)
-        dot_prod = (vel_self * vel_targ).sum(dim=-1, keepdim=True)
+        # Reshape back to time
+        interact_summ = interact_summ.view(b, t, -1) # [B, T, 32]
         
-        # Combine: [Ix, Iy, Dist, SpeedDiff, VelDot] -> 5 Dims
-        rel_feats = torch.cat([interaction_raw, speed_diff, dot_prod], dim=-1)
-        
-        # Embed
-        rel_embed = self.relational_mlp(rel_feats) # [B, T, 16]
+        # Final Embedding
+        rel_embed = self.relational_mlp(interact_summ) # [B, T, 32]
 
         return agent_canon, target_canon, rel_embed
 
@@ -376,16 +411,15 @@ class MorphologicalInteractionCore(nn.Module):
         self.adapter = CanonicalGraphAdapter(input_nodes=11, canonical_nodes=11, num_labs=num_labs)
         self.interaction = SocialInteractionBlock()
 
-        # Fusion: (11 nodes * 16 features * 2 agents) + 16 relation = 368
-        self.frame_fusion = nn.Linear(368, 128)
+        # Fusion: (11 nodes * 16 features * 2 agents) + 32 relation = 384
+        self.frame_fusion = nn.Linear(384, 128)
 
     def forward(self, agent_x, target_x, lab_idx):
         # 1. Adapt Topology (Refine Physics/Geometry)
         a_c = self.adapter(agent_x, lab_idx)
         t_c = self.adapter(target_x, lab_idx)
 
-        # 2. Compute Social Relations
-        # This uses the specific relative features baked into Module 1
+        # 2. Compute Social Relations (Graph Attention)
         _, _, rel_embed = self.interaction(a_c, t_c)
 
         # 3. Flatten for Transformer Input
@@ -395,7 +429,7 @@ class MorphologicalInteractionCore(nn.Module):
 
         # 4. Dense Fusion
         # Fuses Self(A) + Self(B) + Relationship
-        combined = torch.cat([a_flat, t_flat, rel_embed], dim=-1) # [B, T, 368]
+        combined = torch.cat([a_flat, t_flat, rel_embed], dim=-1) # [B, T, 384]
         out = self.frame_fusion(combined) # [B, T, 128]
 
         # Returns: 
@@ -404,9 +438,6 @@ class MorphologicalInteractionCore(nn.Module):
         return out, a_c, t_c
 
 # Module 3: The Split-Stream Interaction Block
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class SplitStreamInteractionBlock(nn.Module):
     def __init__(self, node_dim=16, hidden_dim=128):
@@ -434,9 +465,7 @@ class SplitStreamInteractionBlock(nn.Module):
         # Focus: Interaction, Distance, Chasing, Fight.
         # Input: Agent (Full) + Target (Full) + Interaction Token.
         
-        # 1. Relational Engine
-        # The new Module 1 (Geo Features) pre-calculates distance/rel_pos in Ch 4-6.
-        # We extract this directly rather than re-calculating on the fly.
+        # 1. Relational Engine (Simple Distance/Speed for Pair stream fallback)
         self.relational_mlp = nn.Sequential(
             nn.Linear(3, 32), # [Rel_X, Rel_Y, Rel_Dist] averaged over nodes
             nn.GELU(),
@@ -459,10 +488,11 @@ class SplitStreamInteractionBlock(nn.Module):
         # [1, 0] = "I am Acting", [0, 1] = "I am Receiving"
         self.role_embedding = nn.Parameter(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
 
-    def forward(self, agent_c, target_c):
+    def forward(self, agent_c, target_c, role_indices=None):
         """
         agent_c:  [Batch, Time, 11, 16] (Canonical Skeleton w/ Geo Features)
         target_c: [Batch, Time, 11, 16] 
+        role_indices: [Batch] Tensor of 0 or 1. If None, defaults to 0 (Agent).
         """
         batch, time, nodes, feat = agent_c.shape
 
@@ -485,14 +515,21 @@ class SplitStreamInteractionBlock(nn.Module):
         
         # Extract Relational Data baked into Module 1 output
         # Channels: 4 (Neighbor X), 5 (Neighbor Y), 6 (Dist)
-        # We assume mean interaction across nodes represents the body-level interaction
         rel_feats = agent_c[..., 4:7].mean(dim=2) # [B, T, 3]
         
         # Embed Relation
         rel_embed = self.relational_mlp(rel_feats) # [B, T, 32]
 
-        # Add Role Tokens (Broadcasting Agent Role [1,0])
-        role_token = self.role_embedding[0].view(1, 1, 2).expand(batch, time, 2)
+        # Select Role Tokens
+        # If role_indices is provided, use it. Else default to Agent (0)
+        if role_indices is None:
+            # Default: All are Agents [1,0]
+            selected_role = self.role_embedding[0].view(1, 1, 2).expand(batch, time, 2)
+        else:
+            # Gather based on index [B]
+            # self.role_embedding is [2, 2]
+            # we want [B, 2] -> expand to [B, T, 2]
+            selected_role = self.role_embedding[role_indices].unsqueeze(1).expand(batch, time, 2)
 
         # Fuse Pair Features
         # Concatenate: Agent(Full) + Target(Full) + Relation + Role
@@ -500,7 +537,7 @@ class SplitStreamInteractionBlock(nn.Module):
             agent_flat_full, 
             target_flat_full, 
             rel_embed, 
-            role_token
+            selected_role
         ], dim=-1)
         
         pair_feat = self.pair_projector(pair_input) # [B, T, 128]
@@ -508,10 +545,6 @@ class SplitStreamInteractionBlock(nn.Module):
         return self_feat, pair_feat
 
 # Module 4: The Local-Global Chronos Encoder
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 class LocalGlobalChronosEncoder(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=128):
@@ -536,7 +569,7 @@ class LocalGlobalChronosEncoder(nn.Module):
         self.global_transformer = nn.TransformerEncoder(global_layer, num_layers=2)
 
         # ======================================================================
-        # 2. LOCAL SELF STREAM (The "Me" Branch) - DEEP TCN
+        # 2. LOCAL SELF STREAM (The "Me" Branch) - DEEP TCN + ATTENTION
         # ======================================================================
         # Updated: Receptive Field ~2.0 seconds (64 frames)
         self.self_tcn = nn.Sequential(
@@ -554,24 +587,17 @@ class LocalGlobalChronosEncoder(nn.Module):
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
-
-            # Long Range (d=8) -> +16 frames context
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=8, dilation=8),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-
-            # Very Long Range (d=16) -> +32 frames context (TOTAL ~64)
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=16, dilation=16),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU()
         )
         
+        # New: Bidirectional Transformer for Local Temporal Mixing
+        self.self_local_attn = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
+
         # Cross-Attention to Global 
         self.self_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.self_norm = nn.LayerNorm(hidden_dim)
 
         # ======================================================================
-        # 3. LOCAL PAIR STREAM (The "Us" Branch) - DEEP TCN
+        # 3. LOCAL PAIR STREAM (The "Us" Branch) - DEEP TCN + ATTENTION
         # ======================================================================
         self.pair_tcn = nn.Sequential(
             # Frame Level
@@ -588,17 +614,10 @@ class LocalGlobalChronosEncoder(nn.Module):
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
-            
-            # Long (Interaction Buildup)
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=8, dilation=8),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            
-            # Very Long (Sustained Aggression/Chase)
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=16, dilation=16),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU()
         )
+
+        # New: Bidirectional Transformer for Local Temporal Mixing
+        self.pair_local_attn = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
         
         # Cross-Attention to Global
         self.pair_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
@@ -621,7 +640,10 @@ class LocalGlobalChronosEncoder(nn.Module):
         s_in = local_self.permute(0, 2, 1) # [B, C, T]
         s_tcn = self.self_tcn(s_in).permute(0, 2, 1) # [B, T, C]
 
-        # 2. Cross-Attention
+        # 2. Local Transformer (Bidirectional)
+        s_tcn = self.self_local_attn(s_tcn)
+
+        # 3. Cross-Attention
         # Query: Local TCN, Key/Value: Global Memory
         s_ctx, _ = self.self_attn(query=s_tcn, key=global_memory, value=global_memory)
         self_out = self.self_norm(s_tcn + s_ctx) 
@@ -631,7 +653,10 @@ class LocalGlobalChronosEncoder(nn.Module):
         p_in = local_pair.permute(0, 2, 1)
         p_tcn = self.pair_tcn(p_in).permute(0, 2, 1)
 
-        # 2. Cross-Attention
+        # 2. Local Transformer (Bidirectional)
+        p_tcn = self.pair_local_attn(p_tcn)
+
+        # 3. Cross-Attention
         p_ctx, _ = self.pair_attn(query=p_tcn, key=global_memory, value=global_memory)
         pair_out = self.pair_norm(p_tcn + p_ctx)
 
@@ -655,9 +680,6 @@ class PositionalEncoding(nn.Module):
 
 
 # Module 5: The Multi-Task Logic Head
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class MultiTaskLogicHead(nn.Module):
     def __init__(self, input_dim=128, num_labs=20):
@@ -745,37 +767,7 @@ class MultiTaskLogicHead(nn.Module):
 
         return self_probs, pair_probs, center_score
 
-# Module 6: Final Assembly (EthoSwarmNet V3)
-import torch
-import torch.nn as nn
-
-# ==============================================================================
-# BEHAVIOR DEFINITIONS (For Output Stitching)
-# ==============================================================================
-# All 37 actions sorted alphabetically (Competition Standard)
-ACTION_LIST = sorted([
-    "allogroom", "approach", "attack", "attemptmount", "avoid", "biteobject",
-    "chase", "chaseattack", "climb", "defend", "dig", "disengage", "dominance",
-    "dominancegroom", "dominancemount", "ejaculate", "escape", "exploreobject",
-    "flinch", "follow", "freeze", "genitalgroom", "huddle", "intromit", "mount",
-    "rear", "reciprocalsniff", "rest", "run", "selfgroom", "shepherd", "sniff",
-    "sniffbody", "sniffface", "sniffgenital", "submit", "tussle"
-])
-
-# Subset: 11 Self Behaviors (Agent only)
-SELF_BEHAVIORS = sorted([
-    "biteobject", "climb", "dig", "exploreobject", "freeze", "genitalgroom",
-    "huddle", "rear", "rest", "run", "selfgroom"
-])
-
-# Subset: 26 Pair Behaviors (Agent + Target)
-PAIR_BEHAVIORS = sorted([
-    "allogroom", "approach", "attack", "attemptmount", "avoid", "chase",
-    "chaseattack", "defend", "disengage", "dominance", "dominancegroom",
-    "dominancemount", "ejaculate", "escape", "flinch", "follow", "intromit",
-    "mount", "reciprocalsniff", "shepherd", "sniff", "sniffbody", "sniffface",
-    "sniffgenital", "submit", "tussle"
-])
+# Module 6: Final Assembly (EthoSwarmNet V4 - Enhanced)
 
 class EthoSwarmNet(nn.Module):
     def __init__(self, num_classes=37, input_dim=128):
@@ -819,9 +811,9 @@ class EthoSwarmNet(nn.Module):
                 pass
         return torch.tensor(indices, dtype=torch.long)
 
-    def forward(self, global_agent, global_target, local_agent, local_target, lab_idx):
+    def forward(self, global_agent, global_target, local_agent, local_target, lab_idx, role_idx=None):
         """
-        The V3 Forward Pass:
+        The V4 Forward Pass:
         Global/Local Streams -> Topology -> Split -> Time -> Logic -> Stitch
         """
 
@@ -830,7 +822,8 @@ class EthoSwarmNet(nn.Module):
         _, l_ac, l_tc = self.morph_core(local_agent, local_target, lab_idx)
 
         # --- B. SPLIT-STREAM (Module 3) ---
-        l_self, l_pair = self.split_interaction(l_ac, l_tc)
+        # Pass Role Index here
+        l_self, l_pair = self.split_interaction(l_ac, l_tc, role_indices=role_idx)
 
         # --- C. TIME & CONTEXT (Module 4) ---
         t_self, t_pair = self.chronos(g_out, l_self, l_pair)
@@ -848,26 +841,9 @@ class EthoSwarmNet(nn.Module):
         final_output.index_copy_(2, self.self_indices, p_self)
         final_output.index_copy_(2, self.pair_indices, p_pair)
         
-        # NOTE: For now, we are returning 'final_output' (37 classes) 
-        # because the Training Loop expects [B, T, 37] matching targets.
-        # The 'center_score' improves internal gradient flow via backprop on Module 5.
-        # If you want to use Center Score explicitly in loss later, return it as tuple:
-        # return final_output, center_score
-        
         return final_output
 
 # Module 7: The Training Loop & Validation
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-import numpy as np
-import pandas as pd
-import os
-import glob
-import json
-import torch.nn.functional as F
 
 # ==============================================================================
 # UTILS & METRICS
@@ -876,14 +852,12 @@ def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
     """
     Loads a boolean mask [20, 37] where 1.0 means the lab annotates that action.
     """
-    # Default to "Allow All" if file missing
     if not os.path.exists(vocab_path):
         return torch.ones(25, 37).to(device)
         
     with open(vocab_path, 'r') as f:
         vocab = json.load(f)
     
-    # Must sort keys to match Module 1 index order
     lab_names = sorted(list(LAB_CONFIGS.keys()))
     mask = torch.zeros(len(lab_names), num_classes).to(device)
     
@@ -896,17 +870,14 @@ def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
             mask[i, :] = 1.0
     return mask
 
-def get_batch_f1(probs_in, targets, batch_vocab_mask, temporal_weights):
+def get_batch_f1(probs_in, targets, batch_vocab_mask, temporal_weights, thresholds=0.4):
     """
-    FIXED: Removed torch.sigmoid(). Input 'probs_in' is already 0.0-1.0 from Model.
+    Calculates F1 Score. 'thresholds' can be a scalar or a [37] tensor.
     """
-    # 1. Binarize Predictions (probs are already 0-1)
-    preds = (probs_in > 0.4).float() 
+    preds = (probs_in > thresholds).float()
     
-    # 2. Combine Masks
     valid_pixels = temporal_weights.unsqueeze(-1) * batch_vocab_mask.unsqueeze(1)
     
-    # 3. Calculate F1 only on VALID pixels
     tp = (preds * targets * valid_pixels).sum()
     fp = (preds * (1-targets) * valid_pixels).sum()
     fn = ((1-preds) * targets * valid_pixels).sum()
@@ -915,47 +886,127 @@ def get_batch_f1(probs_in, targets, batch_vocab_mask, temporal_weights):
     return f1.item()
 
 # ==============================================================================
-# LOSS FUNCTION
+# LOSS FUNCTION (CLASS-BALANCED FOCAL LOSS)
 # ==============================================================================
-class DualStreamMaskedLoss(nn.Module):
-    def __init__(self, model_self_indices, model_pair_indices):
+class DualStreamMaskedFocalLoss(nn.Module):
+    def __init__(self, model_self_indices, model_pair_indices, gamma=2.0):
         super().__init__()
         self.self_idx = model_self_indices
         self.pair_idx = model_pair_indices
+        self.gamma = gamma
 
     def forward(self, model_output_probs, target, weight_mask, lab_vocab_mask):
         """
-        FIXED: Removed torch.sigmoid(). 
-        Model outputs probabilities (0-1) due to Physics Gate.
+        Inputs are ALREADY PROBABILITIES (Sigmoid applied in model).
         """
-        # Slice Output/Target
-        # Inputs are ALREADY PROBABILITIES
         p_self = model_output_probs[:, :, self.self_idx]
         p_pair = model_output_probs[:, :, self.pair_idx]
         
         t_self = target[:, :, self.self_idx]
         t_pair = target[:, :, self.pair_idx]
         
-        # Clamp for numerical stability (prevent log(0))
+        # Clamp
         p_self = torch.clamp(p_self, 1e-7, 1 - 1e-7)
         p_pair = torch.clamp(p_pair, 1e-7, 1 - 1e-7)
         
-        # Slice Lab Masks for Batch
-        m_self = lab_vocab_mask[:, self.self_idx].unsqueeze(1) # [B, 1, n_self]
-        m_pair = lab_vocab_mask[:, self.pair_idx].unsqueeze(1) # [B, 1, n_pair]
-        
-        # Temporal Mask [B, T, 1]
+        # Masking
+        m_self = lab_vocab_mask[:, self.self_idx].unsqueeze(1)
+        m_pair = lab_vocab_mask[:, self.pair_idx].unsqueeze(1)
         tm = weight_mask.unsqueeze(-1)
         
-        # Compute Loss (Standard BCELoss, NOT WithLogits)
-        l_self_raw = F.binary_cross_entropy(p_self, t_self, reduction='none')
-        l_pair_raw = F.binary_cross_entropy(p_pair, t_pair, reduction='none')
+        # Focal Loss: - alpha * (1-pt)^gamma * log(pt)
+        # Here we do simplified Focal on BCE
+        # L = - t * (1-p)^g * log(p) - (1-t) * p^g * log(1-p)
+
+        l_self_pos = -t_self * torch.pow(1 - p_self, self.gamma) * torch.log(p_self)
+        l_self_neg = -(1 - t_self) * torch.pow(p_self, self.gamma) * torch.log(1 - p_self)
+        l_self_raw = l_self_pos + l_self_neg
+
+        l_pair_pos = -t_pair * torch.pow(1 - p_pair, self.gamma) * torch.log(p_pair)
+        l_pair_neg = -(1 - t_pair) * torch.pow(p_pair, self.gamma) * torch.log(1 - p_pair)
+        l_pair_raw = l_pair_pos + l_pair_neg
         
         # Weighted Sum
         loss_s = (l_self_raw * m_self * tm).sum() / ((m_self * tm).sum() + 1e-6)
         loss_p = (l_pair_raw * m_pair * tm).sum() / ((m_pair * tm).sum() + 1e-6)
         
         return loss_s + loss_p
+
+# ==============================================================================
+# THRESHOLD TUNER
+# ==============================================================================
+def find_optimal_thresholds(model, val_loader, device, vocab_mask):
+    print("Optimization: Tuning Per-Class Thresholds on Validation Set...")
+    model.eval()
+
+    # Accumulate all Targets and Preds
+    all_preds = []
+    all_targs = []
+    all_masks = []
+    all_weights = []
+
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Collecting Val Data"):
+            gx, lx, tgt, weights, lid = [b.to(device) for b in batch]
+            probs = model(gx, gx, lx, lx, lid)
+
+            all_preds.append(probs.cpu())
+            all_targs.append(tgt.cpu())
+            all_masks.append(vocab_mask[lid].unsqueeze(1).repeat(1, weights.shape[1], 1).cpu())
+            all_weights.append(weights.cpu())
+
+    # Concat
+    preds = torch.cat(all_preds, dim=0) # [N, T, 37]
+    targs = torch.cat(all_targs, dim=0)
+    masks = torch.cat(all_masks, dim=0)
+    weights = torch.cat(all_weights, dim=0).unsqueeze(-1)
+
+    # Flatten
+    # Valid pixels only
+    preds = preds[weights.bool().repeat(1,1,37)]
+    targs = targs[weights.bool().repeat(1,1,37)]
+    masks = masks[weights.bool().repeat(1,1,37)]
+
+    # Since flattening removes shape structure, let's rethink:
+    # We need per-class optimization.
+
+    best_thresholds = torch.ones(37) * 0.4
+
+    # Check range 0.1 to 0.9
+    search_space = np.linspace(0.1, 0.9, 17)
+
+    for c in range(37):
+        # Slice class c
+        p_c = preds.view(-1, 37)[:, c]
+        t_c = targs.view(-1, 37)[:, c]
+        m_c = masks.view(-1, 37)[:, c]
+
+        # Filter by mask (only consider labs that annotate this)
+        valid_idx = m_c > 0.5
+        if valid_idx.sum() == 0: continue
+
+        p_c = p_c[valid_idx]
+        t_c = t_c[valid_idx]
+
+        best_f1 = -1
+        best_th = 0.4
+
+        for th in search_space:
+            bin_preds = (p_c > th).float()
+            tp = (bin_preds * t_c).sum()
+            fp = (bin_preds * (1-t_c)).sum()
+            fn = ((1-bin_preds) * t_c).sum()
+
+            f1 = 2*tp / (2*tp + fp + fn + 1e-6)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+
+        best_thresholds[c] = best_th
+        # print(f"Class {c}: Best Thresh {best_th:.2f} (F1 {best_f1:.3f})")
+
+    return best_thresholds
 
 # ==============================================================================
 # TRAINING CONTROLLER
@@ -967,15 +1018,17 @@ def train_ethoswarm_v3():
     elif os.path.exists('/kaggle/input/MABe-mouse-behavior-detection'):
         DATA_PATH = '/kaggle/input/MABe-mouse-behavior-detection'
     else: 
-        print("Dataset not found."); return
+        DATA_PATH = "./" # Fallback for local
+        if not os.path.exists(DATA_PATH + "/train.csv"):
+             print("Dataset not found."); return
     
     VOCAB_PATH = '/kaggle/input/mabe-metadata/results/lab_vocabulary.json'
     
     gpu_count = torch.cuda.device_count()
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     BATCH_SIZE = 8 * max(1, gpu_count)
-    LEARNING_RATE = 3e-4 
-    NUM_EPOCHS = 5
+    LEARNING_RATE = 2e-4  # Slightly lower for Transformer stability
+    NUM_EPOCHS = 10       # Increased Epochs
 
     print(f"Start Training on {gpu_count} GPU(s) | Batch Size: {BATCH_SIZE}")
 
@@ -988,7 +1041,7 @@ def train_ethoswarm_v3():
     train_ids = vids[:split]
     val_ids = vids[split:]
     
-    # Loaders - using Module 1 (Cached)
+    # Loaders
     train_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=train_ids)
     val_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=val_ids)
     
@@ -1005,6 +1058,7 @@ def train_ethoswarm_v3():
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, steps_per_epoch=len(train_loader), epochs=NUM_EPOCHS)
+    scaler = torch.cuda.amp.GradScaler() # Mixed Precision
     
     # Load Masks
     lab_masks = load_lab_vocabulary(VOCAB_PATH, ACTION_TO_IDX, NUM_CLASSES, DEVICE)
@@ -1019,7 +1073,7 @@ def train_ethoswarm_v3():
          "mount", "reciprocalsniff", "shepherd", "sniff", "sniffbody", "sniffface", 
          "sniffgenital", "submit", "tussle"])]
          
-    loss_fn = DualStreamMaskedLoss(self_indices, pair_indices)
+    loss_fn = DualStreamMaskedFocalLoss(self_indices, pair_indices, gamma=2.0)
 
     # --- 4. EPOCH LOOP ---
     for epoch in range(NUM_EPOCHS):
@@ -1030,26 +1084,29 @@ def train_ethoswarm_v3():
         run_f1 = 0.0
         
         for i, batch in enumerate(loop):
-            # Move 5 items to GPU
+            # Move items to GPU
             gx, lx, tgt, weights, lid = [b.to(DEVICE) for b in batch]
             
             optimizer.zero_grad()
             
-            # Forward 
-            # Output is PROBABILITIES now (from Module 5+6)
-            probs = model(gx, gx, lx, lx, lid)
+            # Role Flipping Augmentation
+            role_idx = None
+            if random.random() < 0.5:
+                 role_idx = torch.ones(gx.shape[0], dtype=torch.long).to(DEVICE) # Role 1
             
-            # Loss Calc 
-            loss = loss_fn(probs, tgt, weights, lab_masks[lid])
+            # Mixed Precision Forward
+            with torch.cuda.amp.autocast():
+                probs = model(gx, gx, lx, lx, lid, role_idx)
+                loss = loss_fn(probs, tgt, weights, lab_masks[lid])
             
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # Backward
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             
             # Metrics
             with torch.no_grad():
-                # FIXED: Don't sigmoid again
                 f1 = get_batch_f1(probs, tgt, lab_masks[lid], weights)
                 
             run_loss = 0.9*run_loss + 0.1*loss.item() if i>0 else loss.item()
@@ -1071,7 +1128,6 @@ def train_ethoswarm_v3():
                 probs = model(gx, gx, lx, lx, lid)
                 loss = loss_fn(probs, tgt, weights, lab_masks[lid])
                 
-                # Metric
                 f1 = get_batch_f1(probs, tgt, lab_masks[lid], weights)
                 
                 val_loss_sum += loss.item()
@@ -1081,9 +1137,15 @@ def train_ethoswarm_v3():
         print(f"Val Loss: {val_loss_sum/batches:.4f} | Val F1: {val_f1_sum/batches:.4f}")
         
         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-        torch.save(state, f"ethoswarm_v3_ep{epoch+1}.pth")
+        torch.save(state, f"ethoswarm_v4_ep{epoch+1}.pth")
+
+    # --- 5. POST-TRAINING THRESHOLD OPTIMIZATION ---
+    final_thresholds = find_optimal_thresholds(model, val_loader, DEVICE, lab_masks)
+
+    # Save Thresholds
+    with open("thresholds.json", "w") as f:
+        json.dump(final_thresholds.cpu().tolist(), f)
+    print("Saved optimal thresholds to thresholds.json")
 
 if __name__ == '__main__':
     train_ethoswarm_v3()
-  
-
