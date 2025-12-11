@@ -190,29 +190,32 @@ class BioPhysicsDataset(Dataset):
             if d1_full.empty or d2_full.empty:
                 return None, None, None, None, None
 
-            # Fill Buffer (No 'frame' column dependency)
-            L_alloc = len(df)
+            # Use 'video_frame' column for correct indexing (0-based)
+            max_frame = df['video_frame'].max()
+            L_alloc = max_frame + 1
+
             raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
             raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-            max_len = 0
-
             for i, bp in enumerate(BODY_PARTS):
                 # Mouse 1
-                v1 = d1_full[d1_full['bodypart']==bp][['x', 'y']].values
-                if len(v1) > 0:
-                    raw_m1[:len(v1), i] = v1
-                    max_len = max(max_len, len(v1))
+                v1 = d1_full[d1_full['bodypart']==bp]
+                if not v1.empty:
+                    indices = v1['video_frame'].values
+                    vals = v1[['x', 'y']].values
+                    valid = indices < L_alloc
+                    raw_m1[indices[valid], i] = vals[valid]
 
                 # Mouse 2
-                v2 = d2_full[d2_full['bodypart']==bp][['x', 'y']].values
-                if len(v2) > 0:
-                    raw_m2[:len(v2), i] = v2
-                    max_len = max(max_len, len(v2))
+                v2 = d2_full[d2_full['bodypart']==bp]
+                if not v2.empty:
+                    indices = v2['video_frame'].values
+                    vals = v2[['x', 'y']].values
+                    valid = indices < L_alloc
+                    raw_m2[indices[valid], i] = vals[valid]
 
-            # Slice to actual max length
-            raw_m1 = raw_m1[:max_len]
-            raw_m2 = raw_m2[:max_len]
+            # Buffer is now full size L_alloc (matching video length)
+            # No need to slice to 'max_len' if L_alloc is the video length.
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)

@@ -347,27 +347,35 @@ class BioPhysicsDataset(Dataset):
                 df_t = df[df['mouse_id_str'] == str(target_id)]
 
                 if not df_a.empty and not df_t.empty:
-                    # Allocate safe upper bound buffer
-                    L_alloc = len(df)
+                    # Use 'video_frame' column for correct indexing (0-based)
+                    # Note: We assume 'video_frame' exists based on user feedback.
+                    max_frame = df['video_frame'].max()
+                    L_alloc = max_frame + 1
+
                     full_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
                     full_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-                    max_frame = 0
-
-                    # Fill Buffer (Main Branch Logic - No 'frame' column dependency)
+                    # Fill Buffer using video_frame index
                     for i, bp in enumerate(BODY_PARTS):
-                        d1 = df_a[df_a['bodypart']==bp][['x','y']].values
-                        if len(d1) > 0:
-                            full_m1[:len(d1), i] = d1
-                            max_frame = max(max_frame, len(d1))
+                        # Mouse 1
+                        d1 = df_a[df_a['bodypart']==bp]
+                        if not d1.empty:
+                            indices = d1['video_frame'].values
+                            vals = d1[['x', 'y']].values
+                            # Safety check for indices bounds
+                            valid = indices < L_alloc
+                            full_m1[indices[valid], i] = vals[valid]
 
-                        d2 = df_t[df_t['bodypart']==bp][['x','y']].values
-                        if len(d2) > 0:
-                            full_m2[:len(d2), i] = d2
-                            max_frame = max(max_frame, len(d2))
+                        # Mouse 2
+                        d2 = df_t[df_t['bodypart']==bp]
+                        if not d2.empty:
+                            indices = d2['video_frame'].values
+                            vals = d2[['x', 'y']].values
+                            valid = indices < L_alloc
+                            full_m2[indices[valid], i] = vals[valid]
 
                     # Slice Window
-                    L = max_frame
+                    L = L_alloc
                     if L > 0:
                         if center is None: center = random.randint(0, L)
                         s = max(0, min(center - self.local_window//2, L - self.local_window))
@@ -380,7 +388,7 @@ class BioPhysicsDataset(Dataset):
                         raw_m2 = full_m2[s:e]
                         data_loaded = True
                     else:
-                        debug_msg = "Zero length sequence extracted."
+                        debug_msg = "Zero length sequence from video_frame."
                 else:
                     debug_msg = f"Empty filter. Found: {df['mouse_id'].unique()}"
             except Exception as e:
