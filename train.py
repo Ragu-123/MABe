@@ -208,8 +208,8 @@ class BioPhysicsDataset(Dataset):
                         self.samples.append({
                             'video_id': vid,
                             'lab_id': lab,
-                            'agent_id': agent,
-                            'target_id': target,
+                            'agent_id': str(agent),  # FORCE STRING
+                            'target_id': str(target), # FORCE STRING
                             'behaviors_labeled': b_label
                         })
 
@@ -331,9 +331,10 @@ class BioPhysicsDataset(Dataset):
                 
                 # Check format
                 if 'mouse_id' in df.columns:
-                    # Filter
-                    df_a = df[df['mouse_id'] == agent_id]
-                    df_t = df[df['mouse_id'] == target_id]
+                    # Filter with robust type handling
+                    df['mouse_id_str'] = df['mouse_id'].astype(str)
+                    df_a = df[df['mouse_id_str'] == str(agent_id)]
+                    df_t = df[df['mouse_id_str'] == str(target_id)]
 
                     if not df_a.empty and not df_t.empty:
                         # Optimized: Get frame counts
