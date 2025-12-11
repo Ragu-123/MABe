@@ -1364,9 +1364,9 @@ def train_ethoswarm_v3():
             for batch in val_loader:
                 gx, lx, tgt, weights, lid, c_tgt, meta = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
 
-                # Check NaNs
-                if torch.isnan(gx).any() or torch.isnan(lx).any():
-                    print("WARNING: NaN in input data during validation! Skipping batch.")
+                # Check NaNs and Empty Data (to prevent CUDA crashes)
+                if torch.isnan(gx).any() or torch.isnan(lx).any() or (weights.sum(dim=1) == 0).any():
+                    # print("WARNING: NaN or Empty input data during validation! Skipping batch.")
                     continue
                 
                 probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid)

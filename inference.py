@@ -227,7 +227,7 @@ class BioPhysicsDataset(Dataset):
             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
             # Frames: Just indices since we don't have 'frame' column
-            frames = np.arange(max_len)
+            frames = np.arange(L_alloc)
 
             return torch.tensor(feats), lab_idx, agent_id, target_id, frames
 
