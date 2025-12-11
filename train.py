@@ -1407,17 +1407,27 @@ def train_ethoswarm_v3():
 
         with torch.no_grad():
             for batch in val_loader:
-                gx, lx, tgt, weights, lid, c_tgt, meta = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
+                try:
+                    batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
+                    gx, lx, tgt, weights, lid, c_tgt, meta = batch
 
-                # Check NaNs and Empty Data (to prevent CUDA crashes)
-                if torch.isnan(gx).any() or torch.isnan(lx).any() or (weights.sum(dim=1) == 0).any():
-                    # print("WARNING: NaN or Empty input data during validation! Skipping batch.")
+                    # Ensure float32/contiguous
+                    gx = gx.float().contiguous()
+                    lx = lx.float().contiguous()
+
+                    # Safety Checks (NaN, Inf, Empty)
+                    if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
+                        continue
+                    if (weights.sum(dim=1) == 0).any():
+                        continue
+
+                    probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid)
+                    loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
+
+                    val_loss_sum += loss.item()
+                except Exception as e:
+                    print(f"[ERROR] Validation batch failed: {e}")
                     continue
-                
-                probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid)
-                loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
-                
-                val_loss_sum += loss.item()
                 batches += 1
                 
                 # --- ACCUMULATE PREDICTIONS FOR METRIC ---
