@@ -339,6 +339,97 @@ class BioPhysicsDataset(Dataset):
         
         return feat.astype(np.float32)
 
+    def load_full_video_features_for_pair(self, idx):
+        """
+        Loads the FULL video features for sliding window inference for a SPECIFIC pair.
+        Returns: (feats, lab_idx, agent_id, target_id, frames, valid_mask)
+        """
+        sample = self.samples[idx]
+        lab = sample['lab_id']
+        vid = sample['video_id']
+        agent_id = sample['agent_id']
+        target_id = sample['target_id']
+        conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
+
+        fpath = self.tracking_dir / lab / f"{vid}.parquet"
+
+        if not fpath.exists():
+            return None, None, None, None, None, None
+
+        try:
+            # Polars Optimization
+            lf = pl.scan_parquet(fpath)
+
+            # 1. Get Limits
+            meta_df = lf.select(pl.col('video_frame').max()).collect()
+            if meta_df.shape[0] == 0 or meta_df.item(0, 0) is None:
+                 return None, None, None, None, None, None
+
+            max_frame = meta_df.item(0, 0)
+            L_alloc = max_frame + 1
+
+            # 2. Fetch Data for this Pair
+            q = (
+                lf
+                .filter(
+                    pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)])
+                )
+                .collect()
+            )
+
+            if q.is_empty():
+                return None, None, None, None, None, None
+
+            df = q.to_pandas()
+
+            raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+            raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+
+            # Validity Masks
+            valid_m1 = np.zeros(L_alloc, dtype=bool)
+            valid_m2 = np.zeros(L_alloc, dtype=bool)
+
+            # Mouse 1
+            d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
+            for i, bp in enumerate(BODY_PARTS):
+                rows = d1[d1['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m1[indices[valid]] = True
+
+            # Mouse 2
+            d2 = df[df['mouse_id'].astype(str) == str(target_id)]
+            for i, bp in enumerate(BODY_PARTS):
+                rows = d2[d2['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m2[indices[valid]] = True
+
+            # Intersection of presence
+            valid_frames = valid_m1 & valid_m2
+
+            # Fix Teleport
+            raw_m1 = self._fix_teleport(raw_m1)
+            raw_m2 = self._fix_teleport(raw_m2)
+
+            # Feature Extraction
+            feats = self._geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+
+            lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+
+            # Frames: Just indices since we don't have 'frame' column
+            frames = np.arange(L_alloc)
+
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames
+
+        except Exception as e:
+            print(f"Error loading {vid}: {e}")
+            return None, None, None, None, None, None
+
     def _load(self, idx, center=None):
         sample = self.samples[idx]
         lab = sample['lab_id']
@@ -1425,96 +1516,118 @@ def train_ethoswarm_v3():
         submission_rows = []
         solution_rows = []
 
-        with torch.no_grad():
-            for batch in val_loader:
-                try:
-                    batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
-                    gx, lx, tgt, weights, lid, c_tgt, meta = batch
+        # INFERENCE-STYLE VALIDATION LOOP
+        print("Running Inference-Style Validation...")
 
-                    # Ensure float32/contiguous
-                    gx = gx.float().contiguous()
-                    lx = lx.float().contiguous()
+        # We iterate over the dataset directly to get full videos
+        # Limit to first 100 samples if too slow? Or full validation?
+        # User wants full validation logic.
 
-                    # Clamp inputs to prevent exploding gradients/activations
-                    gx = torch.clamp(gx, -100.0, 100.0)
-                    lx = torch.clamp(lx, -100.0, 100.0)
+        WINDOW_SIZE = 256
+        STRIDE = 128
+        thresholds = torch.ones(37).to(DEVICE) * 0.4
 
-                    # Safety Checks (NaN, Inf, Empty)
-                    if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
-                        continue
-                    if (weights.sum(dim=1) == 0).any():
-                        continue
+        for i in tqdm(range(len(val_ds)), desc="Validating Videos"):
+            try:
+                # Load Full Video
+                feats, lab_idx, agent_id, target_id, frames, valid_mask = val_ds.load_full_video_features_for_pair(i)
 
-                    probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid)
-                    loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
+                if feats is None: continue
 
-                    val_loss_sum += loss.item()
-                except Exception as e:
-                    print(f"[ERROR] Validation batch failed: {e}. Stopping validation for this epoch to prevent cascade.")
-                    break
-                batches += 1
-                
-                # --- ACCUMULATE PREDICTIONS FOR METRIC ---
-                # This is slow, but correct.
-                # Thresholding at 0.4
-                bin_preds = (probs > 0.4).cpu().numpy()
-                tgt_np = tgt.cpu().numpy()
-                weights_np = weights.cpu().numpy()
+                # Get Ground Truth from Annotations (Slow but necessary for exact metric)
+                # We need to read the annotation file for this video/pair
+                # This duplicates logic from _load but for full video.
+                # Optimization: Load ALL annotations for this video once.
+                # Since we loop by pair, we can just read the file.
 
-                # Batch Size
-                B, T, _ = bin_preds.shape
-                for b_idx in range(B):
-                    m = meta[b_idx]
-                    vid = m['video_id']
-                    ag = m['agent_id']
-                    tar = m['target_id']
-                    f_start = m['start_frame']
-                    lab_id = m['lab_id']
-                    b_labeled = m['behaviors_labeled']
+                # Load GT
+                sample = val_ds.samples[i]
+                lab = sample['lab_id']
+                vid = sample['video_id']
 
-                    # Iterate actions
-                    for c in range(NUM_CLASSES):
-                        action_name = ACTION_LIST[c]
+                gt_actions = []
+                annot_path = val_ds.annot_dir / lab / f"{vid}.parquet"
+                if annot_path.exists():
+                     adf = pd.read_parquet(annot_path)
+                     # Filter for this pair
+                     # Column names might vary, assuming 'agent', 'target' based on previous code
+                     if 'agent' in adf.columns:
+                         adf = adf[(adf['agent'] == agent_id) & (adf['target'] == target_id)]
 
-                        # 1. GROUND TRUTH (Solution)
-                        # Find continuous segments of 1s in tgt_np
-                        # Only where weights are valid
-                        valid_tgt = tgt_np[b_idx, :, c] * weights_np[b_idx]
-
-                        # Simple RLE
-                        padded = np.concatenate(([0], valid_tgt, [0]))
-                        diffs = np.diff(padded)
-                        starts = np.where(diffs == 1)[0]
-                        stops = np.where(diffs == -1)[0]
-
-                        for s, e in zip(starts, stops):
-                            solution_rows.append({
+                     for _, row in adf.iterrows():
+                         if row['action'] in ACTION_TO_IDX:
+                             gt_actions.append(row)
+                             solution_rows.append({
                                 'video_id': vid,
-                                'agent_id': ag,
-                                'target_id': tar,
-                                'action': action_name,
-                                'start_frame': int(f_start + s),
-                                'stop_frame': int(f_start + e),
-                                'lab_id': lab_id,
-                                'behaviors_labeled': b_labeled
-                            })
+                                'agent_id': agent_id,
+                                'target_id': target_id,
+                                'action': row['action'],
+                                'start_frame': row['start_frame'],
+                                'stop_frame': row['stop_frame'],
+                                'lab_id': lab,
+                                'behaviors_labeled': sample.get('behaviors_labeled', "[]")
+                             })
 
-                        # 2. PREDICTION (Submission)
-                        valid_pred = bin_preds[b_idx, :, c] * weights_np[b_idx]
-                        padded_p = np.concatenate(([0], valid_pred, [0]))
-                        diffs_p = np.diff(padded_p)
-                        starts_p = np.where(diffs_p == 1)[0]
-                        stops_p = np.where(diffs_p == -1)[0]
+                # Run Inference
+                T_total = len(feats)
+                prob_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
+                count_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
 
-                        for s, e in zip(starts_p, stops_p):
-                            submission_rows.append({
-                                'video_id': vid,
-                                'agent_id': ag,
-                                'target_id': tar,
-                                'action': action_name,
-                                'start_frame': int(f_start + s),
-                                'stop_frame': int(f_start + e)
-                            })
+                g_feats_full = feats.unsqueeze(0).to(DEVICE).float().contiguous()
+                g_input = g_feats_full[:, ::30, :, :]
+                if g_input.shape[1] == 0: g_input = g_feats_full
+
+                for start in range(0, T_total, STRIDE):
+                    end = min(start + WINDOW_SIZE, T_total)
+
+                    # Skip invalid windows (MIRRORS TRAINING)
+                    if not valid_mask[start:end].any():
+                        continue
+
+                    l_input = g_feats_full[:, start:end, :, :]
+                    lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
+
+                    # Pad if needed
+                    if l_input.shape[1] < WINDOW_SIZE:
+                        pad_n = WINDOW_SIZE - l_input.shape[1]
+                        l_input = F.pad(l_input, (0, 0, 0, 0, 0, pad_n))
+
+                    # Forward
+                    with torch.cuda.amp.autocast():
+                        probs, _, _ = model(g_input, g_input, l_input, l_input, lid_tensor)
+
+                    # Accumulate (Crop padding)
+                    valid_len = end - start
+                    prob_accum[start:end] += probs[0, :valid_len]
+                    count_accum[start:end] += 1.0
+
+                # Average
+                final_probs = prob_accum / (count_accum + 1e-6)
+                preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
+
+                # Convert to Segments
+                for c in range(NUM_CLASSES):
+                    action_name = ACTION_LIST[c]
+                    binary_seq = preds[:, c]
+                    diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
+                    starts = np.where(diffs == 1)[0]
+                    stops = np.where(diffs == -1)[0]
+
+                    for s, e in zip(starts, stops):
+                        submission_rows.append({
+                             'video_id': vid,
+                             'agent_id': agent_id,
+                             'target_id': target_id,
+                             'action': action_name,
+                             'start_frame': frames[s], # Map back to video frame
+                             'stop_frame': frames[e-1]
+                        })
+
+                batches += 1 # Count successful videos
+
+            except Exception as e:
+                print(f"Validation Error on {i}: {e}")
+                continue
 
         # CALCULATE METRIC
         try:
