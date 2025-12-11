@@ -1415,6 +1415,10 @@ def train_ethoswarm_v3():
                     gx = gx.float().contiguous()
                     lx = lx.float().contiguous()
 
+                    # Clamp inputs to prevent exploding gradients/activations
+                    gx = torch.clamp(gx, -100.0, 100.0)
+                    lx = torch.clamp(lx, -100.0, 100.0)
+
                     # Safety Checks (NaN, Inf, Empty)
                     if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
                         continue
@@ -1426,8 +1430,8 @@ def train_ethoswarm_v3():
 
                     val_loss_sum += loss.item()
                 except Exception as e:
-                    print(f"[ERROR] Validation batch failed: {e}")
-                    continue
+                    print(f"[ERROR] Validation batch failed: {e}. Stopping validation for this epoch to prevent cascade.")
+                    break
                 batches += 1
                 
                 # --- ACCUMULATE PREDICTIONS FOR METRIC ---
@@ -1494,16 +1498,18 @@ def train_ethoswarm_v3():
 
         # CALCULATE METRIC
         try:
+            val_loss_avg = val_loss_sum / batches if batches > 0 else 0.0
+
             if len(solution_rows) > 0 and len(submission_rows) > 0:
                 sol_df = pd.DataFrame(solution_rows)
                 sub_df = pd.DataFrame(submission_rows)
                 real_score = mouse_fbeta(sol_df, sub_df)
-                print(f"Val Loss: {val_loss_sum/batches:.4f} | REAL F1 Score: {real_score:.4f}")
+                print(f"Val Loss: {val_loss_avg:.4f} | REAL F1 Score: {real_score:.4f}")
             else:
-                 print(f"Val Loss: {val_loss_sum/batches:.4f} | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
+                 print(f"Val Loss: {val_loss_avg:.4f} | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
         except Exception as e:
             print(f"Metric Calculation Failed: {e}")
-            print(f"Val Loss: {val_loss_sum/batches:.4f}")
+            print(f"Val Loss: {val_loss_sum/batches if batches > 0 else 0.0:.4f}")
         
         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         torch.save(state, f"ethoswarm_v4_ep{epoch+1}.pth")
