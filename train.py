@@ -1282,7 +1282,8 @@ def train_ethoswarm_v3():
     train_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=train_ids)
     # val_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=val_ids) # REMOVED: Custom validation loop used
     
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=2)
+    # Use 0 workers to prevent deadlock/race conditions with Polars in multiprocessing
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=0)
     
     # --- 3. MODEL INITIALIZATION ---
     model = EthoSwarmNet(num_classes=NUM_CLASSES, input_dim=128)
@@ -1426,16 +1427,21 @@ def train_ethoswarm_v3():
             # Generate Pairs
             pairs = list(permutations(mice, 2))
 
-            # Process Each Pair
             for agent_id, target_id in pairs:
-                # Add GT for this pair to solution
+                # 1. ADD GROUND TRUTH (Filtered first)
+                pair_adf = []
                 for a_row in video_gt_actions:
-                    # Filter matching agent/target if columns exist, otherwise assume all valid?
-                    # Usually annotations have agent/target columns.
+                    # Robust check for agent/target columns (pandas Series / dict)
+                    # We cast to string to match agent_id (str)
                     if 'agent' in a_row and 'target' in a_row:
-                        if str(a_row['agent']) != agent_id or str(a_row['target']) != target_id:
-                            continue
+                        if str(a_row['agent']) == agent_id and str(a_row['target']) == target_id:
+                            pair_adf.append(a_row)
+                    else:
+                        # Fallback: if no columns, maybe single animal or assumed pair?
+                        # But MABe usually specifies. We skip if ambiguous to match training.
+                        pass
 
+                for a_row in pair_adf:
                     solution_rows.append({
                         'video_id': vid,
                         'agent_id': agent_id,
@@ -1555,13 +1561,16 @@ def train_ethoswarm_v3():
 
         # CALCULATE METRIC
         try:
+            print(f"Validation Debug: {len(solution_rows)} GT rows, {len(submission_rows)} Pred rows")
+
             if len(solution_rows) > 0 and len(submission_rows) > 0:
                 sol_df = pd.DataFrame(solution_rows)
                 sub_df = pd.DataFrame(submission_rows)
                 real_score = mouse_fbeta(sol_df, sub_df)
-                print(f"Val Loss: {val_loss_sum:.4f} | REAL F1 Score: {real_score:.4f} (Subset {val_subset_size} vids)")
+                # Loss is not calculated in manual loop, setting to N/A
+                print(f"Val Loss: N/A | REAL F1 Score: {real_score:.4f} (Subset {val_subset_size} vids)")
             else:
-                 print(f"Val Loss: 0.0000 | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
+                 print(f"Val Loss: N/A | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
         except Exception as e:
             print(f"Metric Calculation Failed: {e}")
         
