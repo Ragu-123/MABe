@@ -1568,7 +1568,7 @@ def train_ethoswarm_v3():
                                 'behaviors_labeled': sample.get('behaviors_labeled', "[]")
                              })
 
-                # Run Inference
+                # Run Inference (Batched for Speed & Memory Safety)
                 T_total = len(feats)
                 prob_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
                 count_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
@@ -1577,29 +1577,47 @@ def train_ethoswarm_v3():
                 g_input = g_feats_full[:, ::30, :, :]
                 if g_input.shape[1] == 0: g_input = g_feats_full
 
+                # Collect valid windows first
+                windows = []
+                starts = []
+
                 for start in range(0, T_total, STRIDE):
                     end = min(start + WINDOW_SIZE, T_total)
-
-                    # Skip invalid windows (MIRRORS TRAINING)
-                    if not valid_mask[start:end].any():
-                        continue
+                    if not valid_mask[start:end].any(): continue
 
                     l_input = g_feats_full[:, start:end, :, :]
-                    lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
-
-                    # Pad if needed
                     if l_input.shape[1] < WINDOW_SIZE:
-                        pad_n = WINDOW_SIZE - l_input.shape[1]
-                        l_input = F.pad(l_input, (0, 0, 0, 0, 0, pad_n))
+                         pad_n = WINDOW_SIZE - l_input.shape[1]
+                         l_input = F.pad(l_input, (0,0,0,0,0,pad_n))
 
-                    # Forward
-                    with torch.cuda.amp.autocast():
-                        probs, _, _ = model(g_input, g_input, l_input, l_input, lid_tensor)
+                    windows.append(l_input)
+                    starts.append(start)
 
-                    # Accumulate (Crop padding)
-                    valid_len = end - start
-                    prob_accum[start:end] += probs[0, :valid_len]
-                    count_accum[start:end] += 1.0
+                # Process in Batches
+                INF_BATCH_SIZE = 32
+                for i in range(0, len(windows), INF_BATCH_SIZE):
+                    batch_windows = windows[i : i+INF_BATCH_SIZE]
+                    batch_starts = starts[i : i+INF_BATCH_SIZE]
+
+                    if not batch_windows: continue
+
+                    # Stack
+                    lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
+                    B = lx_batch.shape[0]
+                    gx_batch = g_input.repeat(B, 1, 1, 1)
+                    lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
+
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast():
+                            probs, _, _ = model(gx_batch, gx_batch, lx_batch, lx_batch, lid_batch)
+
+                    # Accumulate
+                    for b in range(B):
+                        start = batch_starts[b]
+                        end = min(start + WINDOW_SIZE, T_total)
+                        valid_len = end - start
+                        prob_accum[start:end] += probs[b, :valid_len]
+                        count_accum[start:end] += 1.0
 
                 # Average
                 final_probs = prob_accum / (count_accum + 1e-6)
