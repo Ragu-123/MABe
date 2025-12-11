@@ -215,6 +215,11 @@ class BioPhysicsDataset(Dataset):
 
         self.local_window = 256
         self.action_windows = []
+
+        # Debug Counters
+        self.print_limit = 10
+        self.print_count = 0
+
         if self.mode == 'train':
             self._scan_actions_safe()
 
@@ -324,6 +329,7 @@ class BioPhysicsDataset(Dataset):
         data_loaded = False
         frame_start = 0
         frame_end = 0
+        debug_msg = ""
 
         if fpath.exists():
             try:
@@ -344,7 +350,7 @@ class BioPhysicsDataset(Dataset):
                         if center is None: center = random.randint(0, L)
                         s = max(0, min(center - self.local_window//2, L - self.local_window))
                         e = min(s + self.local_window, L)
-                        
+
                         frame_start = s
                         frame_end = e
 
@@ -375,9 +381,18 @@ class BioPhysicsDataset(Dataset):
                         fill_buffer(df_a, raw_m1)
                         fill_buffer(df_t, raw_m2)
                         data_loaded = True
+                    else:
+                        debug_msg = f"Empty filter. Found IDs: {df['mouse_id'].unique()}, Wanted: {agent_id}, {target_id}"
+                else:
+                    debug_msg = f"Missing 'mouse_id' column. Columns: {df.columns}"
             except Exception as e:
-                # print(f"Load Error: {e}")
-                pass
+                debug_msg = f"Load Error: {e}"
+        else:
+            debug_msg = f"File not found: {fpath}"
+
+        if not data_loaded and self.print_count < self.print_limit:
+            print(f"[DEBUG] Load Failed for {vid}: {debug_msg}")
+            self.print_count += 1
 
         # 1. Teleport Fix
         raw_m1 = self._fix_teleport(raw_m1)
