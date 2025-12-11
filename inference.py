@@ -283,6 +283,14 @@ class BioPhysicsDataset(Dataset):
 
     def __len__(self): return len(self.samples)
 
+class ValidationDataset(Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return self.ds.load_full_video_features_for_pair(idx)
+
 # ==============================================================================
 # 2. MODEL ARCHITECTURE (Copied exactly from train.py)
 # ==============================================================================
@@ -535,10 +543,14 @@ def run_inference():
     WINDOW_SIZE = 256
     STRIDE = 128
 
+    # Parallel Loader
+    val_dataset_full = ValidationDataset(ds)
+    val_loader_full = torch.utils.data.DataLoader(val_dataset_full, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
+
     print(f"Starting Inference on {len(ds)} samples...")
-    for i in range(len(ds)):
+    for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames, valid_mask = ds.load_full_video_features_for_pair(i)
+        feats, lab_idx, agent_id, target_id, frames, valid_mask = batch_data
 
         if feats is None: continue
 

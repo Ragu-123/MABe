@@ -623,6 +623,14 @@ class BioPhysicsDataset(Dataset):
 
         return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
 
+class ValidationDataset(Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return self.ds.load_full_video_features_for_pair(idx)
+
     def __getitem__(self, idx):
         # Force usage of action windows if available to avoid empty data
         if len(self.action_windows) > 0:
@@ -1527,10 +1535,13 @@ def train_ethoswarm_v3():
         STRIDE = 128
         thresholds = torch.ones(37).to(DEVICE) * 0.4
 
-        for i in tqdm(range(len(val_ds)), desc="Validating Videos"):
+        # Parallel Loader for Validation
+        val_dataset_full = ValidationDataset(val_ds)
+        val_loader_full = DataLoader(val_dataset_full, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
+
+        for i, batch_data in tqdm(enumerate(val_loader_full), total=len(val_loader_full), desc="Validating Videos"):
             try:
-                # Load Full Video
-                feats, lab_idx, agent_id, target_id, frames, valid_mask = val_ds.load_full_video_features_for_pair(i)
+                feats, lab_idx, agent_id, target_id, frames, valid_mask = batch_data
 
                 if feats is None: continue
 
