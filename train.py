@@ -1316,7 +1316,7 @@ def train_ethoswarm_v3():
             # Move items to GPU
             # New: c_tgt, meta
             batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
-            gx, lx, tgt, weights, lid, c_tgt, meta = batch
+            gx, lx, tgt, weights, lid, c_tgt, batch_meta = batch
 
             # Ensure float32/contiguous
             gx = gx.float().contiguous()
@@ -1351,7 +1351,7 @@ def train_ethoswarm_v3():
                 scheduler.step()
             except Exception as e:
                 # print(f"[ERROR] Forward/Backward failed at batch {i}: {e}")
-                # print("Sample metas:", meta[:2])
+                # print("Sample metas:", batch_meta[:2])
                 torch.cuda.empty_cache()
                 continue
             
