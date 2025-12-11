@@ -18,6 +18,107 @@ import math
 from collections import defaultdict
 import polars as pl
 
+# --- KAGGLE METRIC CODE (INTEGRATED) ---
+class HostVisibleError(Exception): pass
+
+def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta: float = 1) -> float:
+    label_frames: defaultdict[str, set[int]] = defaultdict(set)
+    prediction_frames: defaultdict[str, set[int]] = defaultdict(set)
+
+    for row in lab_solution.to_dicts():
+        label_frames[row['label_key']].update(range(row['start_frame'], row['stop_frame']))
+
+    for video in lab_solution['video_id'].unique():
+        if video not in lab_submission['video_id']:
+             continue
+
+        active_labels_str = lab_solution.filter(pl.col('video_id') == video)['behaviors_labeled'].first()
+        if active_labels_str is None:
+            active_labels = set()
+        else:
+            try:
+                active_labels = set(json.loads(active_labels_str))
+            except:
+                active_labels = set()
+
+        predicted_mouse_pairs: defaultdict[str, set[int]] = defaultdict(set)
+
+        for row in lab_submission.filter(pl.col('video_id') == video).to_dicts():
+            if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
+                continue
+
+            new_frames = set(range(row['start_frame'], row['stop_frame']))
+            if row['prediction_key'] in prediction_frames:
+                new_frames = new_frames.difference(prediction_frames[row['prediction_key']])
+
+            prediction_pair = ','.join([str(row['agent_id']), str(row['target_id'])])
+
+            prediction_frames[row['prediction_key']].update(new_frames)
+            predicted_mouse_pairs[prediction_pair].update(new_frames)
+
+    tps = defaultdict(int)
+    fns = defaultdict(int)
+    fps = defaultdict(int)
+
+    for key, pred_frames in prediction_frames.items():
+        action = key.split('_')[-1]
+        matched_label_frames = label_frames[key]
+        tps[action] += len(pred_frames.intersection(matched_label_frames))
+        fns[action] += len(matched_label_frames.difference(pred_frames))
+        fps[action] += len(pred_frames.difference(matched_label_frames))
+
+    distinct_actions = set()
+    for key, frames in label_frames.items():
+        action = key.split('_')[-1]
+        distinct_actions.add(action)
+        if key not in prediction_frames:
+            fns[action] += len(frames)
+
+    action_f1s = []
+    for action in distinct_actions:
+        if tps[action] + fns[action] + fps[action] == 0:
+            action_f1s.append(0)
+        else:
+            action_f1s.append((1 + beta**2) * tps[action] / ((1 + beta**2) * tps[action] + beta**2 * fns[action] + fps[action]))
+
+    if len(action_f1s) == 0: return 0.0
+    return sum(action_f1s) / len(action_f1s)
+
+def mouse_fbeta(solution: pd.DataFrame, submission: pd.DataFrame, beta: float = 1) -> float:
+    if len(solution) == 0: return 0.0
+    if len(submission) == 0: return 0.0
+
+    expected_cols = ['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame']
+    for col in expected_cols:
+        if col not in solution.columns or col not in submission.columns:
+            return 0.0
+
+    solution_pl = pl.DataFrame(solution)
+    submission_pl = pl.DataFrame(submission)
+
+    solution_videos = set(solution_pl['video_id'].unique())
+    submission_pl = submission_pl.filter(pl.col('video_id').is_in(solution_videos))
+
+    solution_pl = solution_pl.with_columns(
+        pl.concat_str([pl.col('video_id').cast(pl.Utf8), pl.col('agent_id').cast(pl.Utf8), pl.col('target_id').cast(pl.Utf8), pl.col('action')], separator='_').alias('label_key'),
+    )
+    submission_pl = submission_pl.with_columns(
+        pl.concat_str([pl.col('video_id').cast(pl.Utf8), pl.col('agent_id').cast(pl.Utf8), pl.col('target_id').cast(pl.Utf8), pl.col('action')], separator='_').alias('prediction_key'),
+    )
+
+    lab_scores = []
+    if 'lab_id' not in solution_pl.columns:
+         lab_scores.append(single_lab_f1(solution_pl, submission_pl, beta=beta))
+    else:
+        for lab in solution_pl['lab_id'].unique():
+            lab_solution = solution_pl.filter(pl.col('lab_id') == lab).clone()
+            lab_videos = set(lab_solution['video_id'].unique())
+            lab_submission = submission_pl.filter(pl.col('video_id').is_in(lab_videos)).clone()
+            lab_scores.append(single_lab_f1(lab_solution, lab_submission, beta=beta))
+
+    if len(lab_scores) == 0: return 0.0
+    return sum(lab_scores) / len(lab_scores)
+
 # --- CONFIGURATION ---
 LAB_CONFIGS = {
     "AdaptableSnail":       {"thresh": 718.59, "window": 120, "pix_cm": 14.5},
@@ -66,6 +167,12 @@ class BioPhysicsDataset(Dataset):
         self.tracking_dir = self.root / f"{mode}_tracking"
         self.annot_dir = self.root / f"{mode}_annotation"
         
+        # Verify Paths
+        if not self.tracking_dir.exists():
+            print(f"WARNING: Tracking directory not found at {self.tracking_dir}")
+        if not self.annot_dir.exists():
+            print(f"WARNING: Annotation directory not found at {self.annot_dir}")
+
         self.metadata = pd.read_csv(self.root / f"{mode}.csv")
         if video_ids is not None:
             self.metadata = self.metadata[self.metadata['video_id'].astype(str).isin(video_ids)]
@@ -74,14 +181,6 @@ class BioPhysicsDataset(Dataset):
         self.samples = []
         print(f"Scanning {len(self.metadata)} videos for mouse pairs...")
 
-        # We need to know which mice are in which video without loading 100GB of parquet.
-        # Strategy: Use a quick scan or metadata if available.
-        # Since metadata usually just has video_id, we might need to peek at files.
-        # Optimization: Most videos have 'mouse1', 'mouse2'. Some have more.
-        # We will optimistically assume [mouse1, mouse2] if we can't check,
-        # or do a lightweight check.
-
-        # For training speed, let's cache this.
         for _, row in tqdm(self.metadata.iterrows(), total=len(self.metadata)):
             vid = str(row['video_id'])
             lab = row['lab_id']
@@ -90,48 +189,19 @@ class BioPhysicsDataset(Dataset):
             fpath = self.tracking_dir / lab / f"{vid}.parquet"
             mice = []
             if fpath.exists():
-                # Read ONLY columns/metadata if possible, or just the first row
                 try:
-                    # PyArrow is faster for metadata
-                    # But for simplicity/compatibility we use pandas with nrows
-                    # Actually, reading columns is enough?
-                    # df = pd.read_parquet(fpath) -> Slow
-                    # Let's try reading minimal
-                    # Ideally we cache this "video_to_mice.json"
-                    # For now, we'll implement a robust fallback:
-                    # Read 1 row
-                    # But we can't easily read 1 row of parquet without scanning?
-                    # Using pd.read_parquet(path, columns=['mouse_id'])?
-
-                    # Assuming we processed this in EDA and know most are 2 mice.
-                    # We will do a full load for now to be safe (or optimize later).
-                    # Optimization: Just read 'mouse_id' column unique values
-
-                    # NOTE: To save time in this turn, I will assume we can get unique mouse_ids
-                    # efficiently. If not, this loop is slow.
-                    # Let's trust the user requirement: "all possible pair combinations".
-
-                    # Fast way:
-                    import pyarrow.parquet as pq
-                    pfile = pq.ParquetFile(fpath)
-                    # We need to scan the 'mouse_id' column.
-                    # This is still heavy.
-
-                    # HEURISTIC: Check if 'mouse3' is in the dictionary values or similar?
-                    # No.
-
-                    # Let's do the "Lazy Permutation" -> We store just Video ID
-                    # And expand in __getitem__? No, __len__ must be fixed.
-
-                    # Hack for speed: Read dataframe, it is cached by OS often.
+                    # Optimized: Just read 'mouse_id' column unique values
                     df_small = pd.read_parquet(fpath, columns=['mouse_id'])
                     mice = df_small['mouse_id'].unique().tolist()
                 except:
                     mice = ['mouse1', 'mouse2'] # Fallback
             else:
-                mice = [] # Missing file
+                mice = []
 
             # Create permutations
+            # Extract behavior labels if available (default to empty string if missing)
+            b_label = row['behaviors_labeled'] if 'behaviors_labeled' in row else "[]"
+
             for agent in mice:
                 for target in mice:
                     if agent != target:
@@ -139,7 +209,8 @@ class BioPhysicsDataset(Dataset):
                             'video_id': vid,
                             'lab_id': lab,
                             'agent_id': agent,
-                            'target_id': target
+                            'target_id': target,
+                            'behaviors_labeled': b_label
                         })
 
         self.local_window = 256
@@ -148,9 +219,7 @@ class BioPhysicsDataset(Dataset):
             self._scan_actions_safe()
 
     def _scan_actions_safe(self):
-        # We try to find files. If not found, we skip optimization, but DO NOT CRASH.
         count = 0
-        # print("Scanning subset of annotations for sampling...")
         # Reduce scan size for speed
         for i, s in enumerate(self.samples):
             if i > 200: break
@@ -162,11 +231,6 @@ class BioPhysicsDataset(Dataset):
                     df = df[df['action'].isin(ACTION_TO_IDX)]
                     if not df.empty:
                         for c in ((df['start_frame'] + df['stop_frame']) // 2).values:
-                            # We need to map this action to the specific sample (Agent/Target)
-                            # But annotations are usually "mouse1, mouse2, action"
-                            # Our sample `s` has specific agent/target.
-                            # We should check if the action row matches this sample's pair?
-                            # For simple "center sampling", random is often enough.
                             self.action_windows.append((i, int(c)))
                             count += 1
                 except: pass
@@ -249,21 +313,21 @@ class BioPhysicsDataset(Dataset):
         
         agent_id = sample['agent_id']
         target_id = sample['target_id']
+        vid = sample['video_id']
+        b_label = sample['behaviors_labeled']
         
-        fpath = self.tracking_dir / lab / f"{sample['video_id']}.parquet"
+        fpath = self.tracking_dir / lab / f"{vid}.parquet"
         
         raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
         raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
 
+        data_loaded = False
+        frame_start = 0
+        frame_end = 0
+
         if fpath.exists():
             try:
                 df = pd.read_parquet(fpath)
-                
-                # Extract Specific Mice
-                # We need to filter by mouse_id.
-                # Assuming long format: 'mouse_id', 'bodypart', 'x', 'y', 'frame'
-                # Or wide: 'mouse1_nose_x'...
-                # The provided EDA suggests 'mouse_id' column exists.
                 
                 # Check format
                 if 'mouse_id' in df.columns:
@@ -271,55 +335,48 @@ class BioPhysicsDataset(Dataset):
                     df_a = df[df['mouse_id'] == agent_id]
                     df_t = df[df['mouse_id'] == target_id]
 
-                    # We need to align frames.
-                    # For window loading, we first determine the window range from the FULL sequence?
-                    # Or do we filter first?
-                    # Filtering full DF is slow.
+                    if not df_a.empty and not df_t.empty:
+                        # Optimized: Get frame counts
+                        L = df['frame'].max() + 1 # Assuming 0-indexed
 
-                    # Optimized: Get frame counts
-                    L = df['frame'].max() + 1 # Assuming 0-indexed
-
-                    # Select Window
-                    if center is None: center = random.randint(0, L)
-                    s = max(0, min(center - self.local_window//2, L - self.local_window))
-                    e = min(s + self.local_window, L)
-
-                    # Slice DF (Frame based)
-                    # Note: df['frame'] might not be sorted or contiguous?
-                    # We assume it is.
-                    df_a = df_a[(df_a['frame'] >= s) & (df_a['frame'] < e)]
-                    df_t = df_t[(df_t['frame'] >= s) & (df_t['frame'] < e)]
-
-                    # Fill buffer
-                    # We need to pivot or map 'bodypart' to index
-                    # This is the slow part.
-                    # Pre-alloc
-                    raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-                    raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-
-                    # Helper to fill
-                    def fill_buffer(sub_df, buffer):
-                        # sub_df has 'frame', 'bodypart', 'x', 'y'
-                        # Map frame to 0..window
-                        f_idx = (sub_df['frame'] - s).values.astype(int)
-                        # Filter valid
-                        valid = (f_idx >= 0) & (f_idx < self.local_window)
+                        # Select Window
+                        if center is None: center = random.randint(0, L)
+                        s = max(0, min(center - self.local_window//2, L - self.local_window))
+                        e = min(s + self.local_window, L)
                         
-                        for i, bp in enumerate(BODY_PARTS):
-                            mask = (sub_df['bodypart'] == bp) & valid
-                            if mask.any():
-                                rows = sub_df[mask]
-                                f_loc = (rows['frame'] - s).values.astype(int)
-                                buffer[f_loc, i, 0] = rows['x'].values
-                                buffer[f_loc, i, 1] = rows['y'].values
+                        frame_start = s
+                        frame_end = e
 
-                    fill_buffer(df_a, raw_m1)
-                    fill_buffer(df_t, raw_m2)
+                        # Slice DF (Frame based)
+                        df_a = df_a[(df_a['frame'] >= s) & (df_a['frame'] < e)]
+                        df_t = df_t[(df_t['frame'] >= s) & (df_t['frame'] < e)]
 
-                else:
-                    # Wide format? Not handled in this snippet update
-                    pass
-            except: pass
+                        # Pre-alloc
+                        raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
+                        raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
+
+                        # Helper to fill
+                        def fill_buffer(sub_df, buffer):
+                            # sub_df has 'frame', 'bodypart', 'x', 'y'
+                            # Map frame to 0..window
+                            f_idx = (sub_df['frame'] - s).values.astype(int)
+                            # Filter valid
+                            valid = (f_idx >= 0) & (f_idx < self.local_window)
+
+                            for i, bp in enumerate(BODY_PARTS):
+                                mask = (sub_df['bodypart'] == bp) & valid
+                                if mask.any():
+                                    rows = sub_df[mask]
+                                    f_loc = (rows['frame'] - s).values.astype(int)
+                                    buffer[f_loc, i, 0] = rows['x'].values
+                                    buffer[f_loc, i, 1] = rows['y'].values
+
+                        fill_buffer(df_a, raw_m1)
+                        fill_buffer(df_t, raw_m2)
+                        data_loaded = True
+            except Exception as e:
+                # print(f"Load Error: {e}")
+                pass
 
         # 1. Teleport Fix
         raw_m1 = self._fix_teleport(raw_m1)
@@ -333,53 +390,32 @@ class BioPhysicsDataset(Dataset):
         weights = torch.zeros(self.local_window, dtype=torch.float32)
         centerness = torch.zeros((self.local_window, 1), dtype=torch.float32)
         
-        # Pad check? (Already alloc to window size, so just weight 0 if empty?)
         # If we loaded zeros, weights remain 0?
         # Let's set weights=1 for loaded frames.
-        # Logic above: s to e.
-        # e-s is valid length.
-        valid_len = e - s if 'e' in locals() else self.local_window
-        weights[:valid_len] = 1.0
+        if data_loaded:
+             valid_len = frame_end - frame_start if 'frame_end' in locals() else self.local_window
+             weights[:valid_len] = 1.0
 
         if self.mode == 'train':
             ap = self.annot_dir / lab / f"{sample['video_id']}.parquet"
             if ap.exists():
                 try:
                     adf = pd.read_parquet(ap)
-                    # Filter for this Pair
-                    # Annotation: 'agent_id', 'target_id'??
-                    # Usually annotations are per-video?
-                    # Check format: 'mouse1', 'mouse2' columns in annot?
-                    # Yes, typically.
-
-                    # Filter rows where agent matches AND target matches
-                    # Agent/Target in parquet might be 'mouse1', 'mouse2' strings?
-                    # Our sample uses 'mouse1', 'mouse2' strings.
-
-                    # If columns exist:
                     if 'agent' in adf.columns and 'target' in adf.columns:
                          # Filter
                          adf = adf[(adf['agent'] == agent_id) & (adf['target'] == target_id)]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
-                            st, et = int(row['start_frame'])-s, int(row['stop_frame'])-s
+                            st, et = int(row['start_frame'])-frame_start, int(row['stop_frame'])-frame_start
                             st, et = max(0, st), min(self.local_window, et)
                             if st < et:
                                 target[st:et, ACTION_TO_IDX[row['action']]] = 1.0
 
                                 # Centerness Target (Gaussian)
-                                # Center of action
-                                # Local center: (st+et)/2
                                 c_local = (st + et) / 2.0
                                 width = et - st
-                                # Generate grid
                                 t_grid = torch.arange(st, et, dtype=torch.float32)
-                                # 0-1 score
-                                # Simple: 1 at center, 0 at edges?
-                                # Regress to IoU? Or Gaussian?
-                                # Gaussian: exp( - (t - c)^2 / (2 * sigma^2) )
-                                # Sigma = width / 6 (3 sigma = half width)
                                 sigma = width / 6.0 + 1e-6
                                 g = torch.exp( - (t_grid - c_local)**2 / (2 * sigma**2) )
                                 centerness[st:et, 0] = torch.max(centerness[st:et, 0], g)
@@ -387,7 +423,18 @@ class BioPhysicsDataset(Dataset):
                 except: pass
         
         lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
-        return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness
+
+        # Pack Metadata
+        meta_info = {
+            'video_id': vid,
+            'agent_id': agent_id,
+            'target_id': target_id,
+            'start_frame': frame_start,
+            'lab_id': lab,
+            'behaviors_labeled': b_label
+        }
+
+        return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
 
     def __getitem__(self, idx):
         if self.mode=='train' and random.random() < 0.9 and len(self.action_windows)>0:
@@ -398,8 +445,8 @@ class BioPhysicsDataset(Dataset):
     def __len__(self): return len(self.samples)
 
 def pad_collate_dual(batch):
-    gx, lx, t, w, lid, center = zip(*batch)
-    return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center)
+    gx, lx, t, w, lid, center, meta = zip(*batch)
+    return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
 
 # Module 2: The Morphological & Interaction Core.
 
@@ -930,6 +977,12 @@ class EthoSwarmNet(nn.Module):
         The V4 Forward Pass:
         Global/Local Streams -> Topology -> Split -> Time -> Logic -> Stitch
         """
+        # Safety: NaNs
+        # It's possible for inputs to be all-zeros (missing data) which is fine, but if NaNs appear we crash.
+        # We can clip or fill NaNs.
+        # Check if NaNs exist? Only if training is unstable.
+        # Ideally, we trust the data loader to not produce NaNs.
+        # The CUDA error might be due to very large gradients or weird values.
 
         # --- A. TOPOLOGY (Module 2) ---
         g_out, _, _ = self.morph_core(global_agent, global_target, lab_idx)
@@ -1008,19 +1061,6 @@ def get_batch_f1(probs_in, targets, batch_vocab_mask, temporal_weights, threshol
     
     f1 = 2*tp / (2*tp + fp + fn + 1e-6)
     return f1.item()
-
-# KAGGLE METRIC
-class HostVisibleError(Exception): pass
-
-def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta: float = 1) -> float:
-    # Simplified version or full?
-    # We will use simplified evaluation for validation hook to avoid Polars dependency complexity in loop
-    # actually polars is fast.
-
-    # ... (Full implementation logic requires mapping tensors back to DataFrames)
-    # This is heavy for batch-loop.
-    # We will implement it for the VALIDATION EPOCH END only.
-    pass
 
 # ==============================================================================
 # LOSS FUNCTION (CLASS-BALANCED FOCAL LOSS + AUX + CENTER)
@@ -1101,7 +1141,7 @@ def find_optimal_thresholds(model, val_loader, device, vocab_mask):
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Collecting Val Data"):
-            gx, lx, tgt, weights, lid, c_tgt = [b.to(device) for b in batch]
+            gx, lx, tgt, weights, lid, c_tgt, _ = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
             probs, _, _ = model(gx, gx, lx, lx, lid)
 
             all_preds.append(probs.cpu())
@@ -1156,14 +1196,20 @@ def find_optimal_thresholds(model, val_loader, device, vocab_mask):
 # ==============================================================================
 def train_ethoswarm_v3():
     # --- 1. SETUP & PATHS ---
+    DATA_PATH = None
     if 'mabe_mouse_behavior_detection_path' in globals():
         DATA_PATH = globals()['mabe_mouse_behavior_detection_path']
+    elif os.path.exists('/kaggle/input/mabe-mouse-behavior-detection/output_dataset'):
+        DATA_PATH = '/kaggle/input/mabe-mouse-behavior-detection/output_dataset'
     elif os.path.exists('/kaggle/input/MABe-mouse-behavior-detection'):
         DATA_PATH = '/kaggle/input/MABe-mouse-behavior-detection'
     else: 
         DATA_PATH = "./" # Fallback
-        if not os.path.exists(DATA_PATH + "/train.csv"):
-             print("Dataset not found."); return
+
+    print(f"Data Path: {DATA_PATH}")
+    if not os.path.exists(f"{DATA_PATH}/train.csv"):
+         print(f"Dataset not found at {DATA_PATH}/train.csv. Aborting.")
+         return
     
     VOCAB_PATH = '/kaggle/input/mabe-metadata/results/lab_vocabulary.json'
     
@@ -1221,8 +1267,8 @@ def train_ethoswarm_v3():
         
         for i, batch in enumerate(loop):
             # Move items to GPU
-            # New: c_tgt
-            gx, lx, tgt, weights, lid, c_tgt = [b.to(DEVICE) for b in batch]
+            # New: c_tgt, meta
+            gx, lx, tgt, weights, lid, c_tgt, meta = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
             
             optimizer.zero_grad()
             
@@ -1258,22 +1304,101 @@ def train_ethoswarm_v3():
         print("Validating...")
         model.eval()
         val_loss_sum = 0
-        val_f1_sum = 0.0
         batches = 0
+
+        # Accumulate for Real Metric
+        submission_rows = []
+        solution_rows = []
+
         with torch.no_grad():
             for batch in val_loader:
-                gx, lx, tgt, weights, lid, c_tgt = [b.to(DEVICE) for b in batch]
+                gx, lx, tgt, weights, lid, c_tgt, meta = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
+
+                # Check NaNs
+                if torch.isnan(gx).any() or torch.isnan(lx).any():
+                    print("WARNING: NaN in input data during validation! Skipping batch.")
+                    continue
                 
                 probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid)
                 loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
                 
-                f1 = get_batch_f1(probs, tgt, lab_masks[lid], weights)
-                
                 val_loss_sum += loss.item()
-                val_f1_sum += f1
                 batches += 1
                 
-        print(f"Val Loss: {val_loss_sum/batches:.4f} | Val F1: {val_f1_sum/batches:.4f}")
+                # --- ACCUMULATE PREDICTIONS FOR METRIC ---
+                # This is slow, but correct.
+                # Thresholding at 0.4
+                bin_preds = (probs > 0.4).cpu().numpy()
+                tgt_np = tgt.cpu().numpy()
+                weights_np = weights.cpu().numpy()
+
+                # Batch Size
+                B, T, _ = bin_preds.shape
+                for b_idx in range(B):
+                    m = meta[b_idx]
+                    vid = m['video_id']
+                    ag = m['agent_id']
+                    tar = m['target_id']
+                    f_start = m['start_frame']
+                    lab_id = m['lab_id']
+                    b_labeled = m['behaviors_labeled']
+
+                    # Iterate actions
+                    for c in range(NUM_CLASSES):
+                        action_name = ACTION_LIST[c]
+
+                        # 1. GROUND TRUTH (Solution)
+                        # Find continuous segments of 1s in tgt_np
+                        # Only where weights are valid
+                        valid_tgt = tgt_np[b_idx, :, c] * weights_np[b_idx]
+
+                        # Simple RLE
+                        padded = np.concatenate(([0], valid_tgt, [0]))
+                        diffs = np.diff(padded)
+                        starts = np.where(diffs == 1)[0]
+                        stops = np.where(diffs == -1)[0]
+
+                        for s, e in zip(starts, stops):
+                            solution_rows.append({
+                                'video_id': vid,
+                                'agent_id': ag,
+                                'target_id': tar,
+                                'action': action_name,
+                                'start_frame': int(f_start + s),
+                                'stop_frame': int(f_start + e),
+                                'lab_id': lab_id,
+                                'behaviors_labeled': b_labeled
+                            })
+
+                        # 2. PREDICTION (Submission)
+                        valid_pred = bin_preds[b_idx, :, c] * weights_np[b_idx]
+                        padded_p = np.concatenate(([0], valid_pred, [0]))
+                        diffs_p = np.diff(padded_p)
+                        starts_p = np.where(diffs_p == 1)[0]
+                        stops_p = np.where(diffs_p == -1)[0]
+
+                        for s, e in zip(starts_p, stops_p):
+                            submission_rows.append({
+                                'video_id': vid,
+                                'agent_id': ag,
+                                'target_id': tar,
+                                'action': action_name,
+                                'start_frame': int(f_start + s),
+                                'stop_frame': int(f_start + e)
+                            })
+
+        # CALCULATE METRIC
+        try:
+            if len(solution_rows) > 0 and len(submission_rows) > 0:
+                sol_df = pd.DataFrame(solution_rows)
+                sub_df = pd.DataFrame(submission_rows)
+                real_score = mouse_fbeta(sol_df, sub_df)
+                print(f"Val Loss: {val_loss_sum/batches:.4f} | REAL F1 Score: {real_score:.4f}")
+            else:
+                 print(f"Val Loss: {val_loss_sum/batches:.4f} | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
+        except Exception as e:
+            print(f"Metric Calculation Failed: {e}")
+            print(f"Val Loss: {val_loss_sum/batches:.4f}")
         
         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         torch.save(state, f"ethoswarm_v4_ep{epoch+1}.pth")
