@@ -623,14 +623,6 @@ class BioPhysicsDataset(Dataset):
 
         return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
 
-class ValidationDataset(Dataset):
-    def __init__(self, ds):
-        self.ds = ds
-    def __len__(self):
-        return len(self.ds)
-    def __getitem__(self, idx):
-        return self.ds.load_full_video_features_for_pair(idx)
-
     def __getitem__(self, idx):
         # Force usage of action windows if available to avoid empty data
         if len(self.action_windows) > 0:
@@ -639,6 +631,14 @@ class ValidationDataset(Dataset):
         return self._load(idx)
     
     def __len__(self): return len(self.samples)
+
+class ValidationDataset(Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return self.ds.load_full_video_features_for_pair(idx)
 
 def pad_collate_dual(batch):
     gx, lx, t, w, lid, center, meta = zip(*batch)
