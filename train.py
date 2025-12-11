@@ -514,7 +514,8 @@ class BioPhysicsDataset(Dataset):
         return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
 
     def __getitem__(self, idx):
-        if self.mode=='train' and random.random() < 0.9 and len(self.action_windows)>0:
+        # Force usage of action windows if available to avoid empty data
+        if len(self.action_windows) > 0:
             i, c = self.action_windows[random.randint(0, len(self.action_windows)-1)]
             return self._load(i, c)
         return self._load(idx)
