@@ -377,7 +377,26 @@ class BioPhysicsDataset(Dataset):
                     L = max_frame + 1
 
                     # 2. Pick Window
-                    if center is None: center = random.randint(0, L)
+                    if center is None:
+                        # Smart sampling: Pick a frame where the mice are actually present
+                        # This prevents empty window queries during validation/random sampling
+                        try:
+                            valid_frames_sample = (
+                                lf
+                                .filter(pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)]))
+                                .select('video_frame')
+                                .head(1000) # Sample a subset to avoid full scan
+                                .collect()
+                            )
+                            if valid_frames_sample.shape[0] > 0:
+                                # Pick random valid frame from the sample
+                                ridx = random.randint(0, valid_frames_sample.shape[0] - 1)
+                                center = valid_frames_sample.item(ridx, 0)
+                            else:
+                                center = random.randint(0, L)
+                        except:
+                            center = random.randint(0, L)
+
                     s = max(0, min(center - self.local_window//2, L - self.local_window))
                     e = min(s + self.local_window, L)
 
