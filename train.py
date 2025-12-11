@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 import math
 from collections import defaultdict
 import polars as pl
+import pyarrow.parquet as pq
 
 # --- KAGGLE METRIC CODE (INTEGRATED) ---
 class HostVisibleError(Exception): pass
@@ -213,6 +214,32 @@ class BioPhysicsDataset(Dataset):
                             'behaviors_labeled': b_label
                         })
 
+        # --- Filter Bad Samples ---
+        def _quick_parquet_has_frames(path):
+            try:
+                pf = pq.ParquetFile(str(path))
+                md = pf.metadata
+                if md.num_rows == 0:
+                    return False
+                try:
+                    col_names = pf.schema_arrow.names
+                    if 'video_frame' in col_names:
+                        return True
+                    return True
+                except:
+                    return True
+            except:
+                return False
+
+        print("Filtering invalid videos...")
+        filtered = []
+        for s in self.samples:
+            p = self.tracking_dir / s['lab_id'] / f"{s['video_id']}.parquet"
+            if p.exists() and _quick_parquet_has_frames(p):
+                filtered.append(s)
+        self.samples = filtered
+        print(f"Retained {len(self.samples)} valid samples.")
+
         self.local_window = 256
         self.action_windows = []
 
@@ -228,7 +255,7 @@ class BioPhysicsDataset(Dataset):
         print("Scanning subset of annotations for sampling...")
         # Reduce scan size for speed
         for i, s in enumerate(self.samples):
-            if i > 200: break
+            # if i > 200: break # REMOVED to scan all
             p = self.annot_dir / s['lab_id'] / f"{s['video_id']}.parquet"
             if p.exists():
                 try:
@@ -1318,7 +1345,19 @@ def train_ethoswarm_v3():
         for i, batch in enumerate(loop):
             # Move items to GPU
             # New: c_tgt, meta
-            gx, lx, tgt, weights, lid, c_tgt, meta = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
+            batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
+            gx, lx, tgt, weights, lid, c_tgt, meta = batch
+
+            # Ensure float32/contiguous
+            gx = gx.float().contiguous()
+            lx = lx.float().contiguous()
+
+            # Safety Checks
+            if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
+                print(f"[WARN] Non-finite inputs in batch {i}, skipping")
+                continue
+            if (weights.sum(dim=1) == 0).all():
+                continue
             
             optimizer.zero_grad()
             
@@ -1327,18 +1366,24 @@ def train_ethoswarm_v3():
             if random.random() < 0.5:
                  role_idx = torch.ones(gx.shape[0], dtype=torch.long).to(DEVICE) # Role 1
             
-            # Mixed Precision Forward
-            with torch.cuda.amp.autocast():
-                # Forward returns 3 items
-                probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid, role_idx)
+            try:
+                # Mixed Precision Forward
+                with torch.cuda.amp.autocast():
+                    # Forward returns 3 items
+                    probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid, role_idx)
 
-                loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
-            
-            # Backward
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+                    loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
+
+                # Backward
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+            except Exception as e:
+                print(f"[ERROR] Forward/Backward failed at batch {i}: {e}")
+                # print("Sample metas:", meta[:2])
+                torch.cuda.empty_cache()
+                continue
             
             # Metrics
             with torch.no_grad():
