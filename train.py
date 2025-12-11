@@ -321,33 +321,54 @@ class BioPhysicsDataset(Dataset):
         target_id = sample['target_id']
         vid = sample['video_id']
         b_label = sample['behaviors_labeled']
-        
+
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
         
-        raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-        raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-
         data_loaded = False
         frame_start = 0
         frame_end = 0
         debug_msg = ""
 
+        raw_m1 = None
+        raw_m2 = None
+
+        # Targets
+        target = torch.zeros((self.local_window, NUM_CLASSES), dtype=torch.float32)
+        weights = torch.zeros(self.local_window, dtype=torch.float32)
+        centerness = torch.zeros((self.local_window, 1), dtype=torch.float32)
+
         if fpath.exists():
             try:
                 df = pd.read_parquet(fpath)
                 
-                # Check format
-                if 'mouse_id' in df.columns:
-                    # Filter with robust type handling
-                    df['mouse_id_str'] = df['mouse_id'].astype(str)
-                    df_a = df[df['mouse_id_str'] == str(agent_id)]
-                    df_t = df[df['mouse_id_str'] == str(target_id)]
+                # Robust ID Filtering
+                df['mouse_id_str'] = df['mouse_id'].astype(str)
+                df_a = df[df['mouse_id_str'] == str(agent_id)]
+                df_t = df[df['mouse_id_str'] == str(target_id)]
 
-                    if not df_a.empty and not df_t.empty:
-                        # Optimized: Get frame counts
-                        L = df['frame'].max() + 1 # Assuming 0-indexed
+                if not df_a.empty and not df_t.empty:
+                    # Allocate safe upper bound buffer
+                    L_alloc = len(df)
+                    full_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+                    full_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-                        # Select Window
+                    max_frame = 0
+
+                    # Fill Buffer (Main Branch Logic - No 'frame' column dependency)
+                    for i, bp in enumerate(BODY_PARTS):
+                        d1 = df_a[df_a['bodypart']==bp][['x','y']].values
+                        if len(d1) > 0:
+                            full_m1[:len(d1), i] = d1
+                            max_frame = max(max_frame, len(d1))
+
+                        d2 = df_t[df_t['bodypart']==bp][['x','y']].values
+                        if len(d2) > 0:
+                            full_m2[:len(d2), i] = d2
+                            max_frame = max(max_frame, len(d2))
+
+                    # Slice Window
+                    L = max_frame
+                    if L > 0:
                         if center is None: center = random.randint(0, L)
                         s = max(0, min(center - self.local_window//2, L - self.local_window))
                         e = min(s + self.local_window, L)
@@ -355,45 +376,28 @@ class BioPhysicsDataset(Dataset):
                         frame_start = s
                         frame_end = e
 
-                        # Slice DF (Frame based)
-                        df_a = df_a[(df_a['frame'] >= s) & (df_a['frame'] < e)]
-                        df_t = df_t[(df_t['frame'] >= s) & (df_t['frame'] < e)]
-
-                        # Pre-alloc
-                        raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-                        raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
-
-                        # Helper to fill
-                        def fill_buffer(sub_df, buffer):
-                            # sub_df has 'frame', 'bodypart', 'x', 'y'
-                            # Map frame to 0..window
-                            f_idx = (sub_df['frame'] - s).values.astype(int)
-                            # Filter valid
-                            valid = (f_idx >= 0) & (f_idx < self.local_window)
-
-                            for i, bp in enumerate(BODY_PARTS):
-                                mask = (sub_df['bodypart'] == bp) & valid
-                                if mask.any():
-                                    rows = sub_df[mask]
-                                    f_loc = (rows['frame'] - s).values.astype(int)
-                                    buffer[f_loc, i, 0] = rows['x'].values
-                                    buffer[f_loc, i, 1] = rows['y'].values
-
-                        fill_buffer(df_a, raw_m1)
-                        fill_buffer(df_t, raw_m2)
+                        raw_m1 = full_m1[s:e]
+                        raw_m2 = full_m2[s:e]
                         data_loaded = True
                     else:
-                        debug_msg = f"Empty filter. Found IDs: {df['mouse_id'].unique()}, Wanted: {agent_id}, {target_id}"
+                        debug_msg = "Zero length sequence extracted."
                 else:
-                    debug_msg = f"Missing 'mouse_id' column. Columns: {df.columns}"
+                    debug_msg = f"Empty filter. Found: {df['mouse_id'].unique()}"
             except Exception as e:
                 debug_msg = f"Load Error: {e}"
         else:
             debug_msg = f"File not found: {fpath}"
 
-        if not data_loaded and self.print_count < self.print_limit:
-            print(f"[DEBUG] Load Failed for {vid}: {debug_msg}")
-            self.print_count += 1
+        # Fallback / Padding
+        if raw_m1 is None:
+            raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
+            raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
+
+        if len(raw_m1) < self.local_window:
+            pad_len = self.local_window - len(raw_m1)
+            pad_arr = np.zeros((pad_len, 11, 2), dtype=np.float32)
+            raw_m1 = np.concatenate([raw_m1, pad_arr], axis=0)
+            raw_m2 = np.concatenate([raw_m2, pad_arr], axis=0)
 
         # 1. Teleport Fix
         raw_m1 = self._fix_teleport(raw_m1)
@@ -402,16 +406,11 @@ class BioPhysicsDataset(Dataset):
         # 3. Features
         feats = self._geo_feats(raw_m1, raw_m2, conf['pix_cm'])
         
-        # 4. Targets (Centerness + Class)
-        target = torch.zeros((self.local_window, NUM_CLASSES), dtype=torch.float32)
-        weights = torch.zeros(self.local_window, dtype=torch.float32)
-        centerness = torch.zeros((self.local_window, 1), dtype=torch.float32)
-        
-        # If we loaded zeros, weights remain 0?
-        # Let's set weights=1 for loaded frames.
+        # 4. Targets Setup
         if data_loaded:
-             valid_len = frame_end - frame_start if 'frame_end' in locals() else self.local_window
-             weights[:valid_len] = 1.0
+             valid_len = frame_end - frame_start
+             if valid_len > 0:
+                 weights[:valid_len] = 1.0
 
         if self.mode == 'train':
             ap = self.annot_dir / lab / f"{sample['video_id']}.parquet"
@@ -441,7 +440,12 @@ class BioPhysicsDataset(Dataset):
         
         lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
-        # DEBUG: Check signal (Moved after weights defined)
+        # Debug Print
+        if not data_loaded and self.print_count < self.print_limit:
+             print(f"[DEBUG] Load Failed for {vid}: {debug_msg}")
+             self.print_count += 1
+
+        # DEBUG: Check signal
         if data_loaded and self.print_count < self.print_limit and weights.sum() == 0:
              print(f"[DEBUG] Weights are ZERO despite DataLoaded! Vid: {vid}, Frame range: {frame_start}-{frame_end}")
              self.print_count += 1

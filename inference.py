@@ -182,7 +182,7 @@ class BioPhysicsDataset(Dataset):
         try:
             df = pd.read_parquet(fpath)
 
-            # Identify Agents based on sample with ROBUST TYPE CHECKING
+            # Robust Filter
             df['mouse_id_str'] = df['mouse_id'].astype(str)
             d1_full = df[df['mouse_id_str']==str(agent_id)]
             d2_full = df[df['mouse_id_str']==str(target_id)]
@@ -190,25 +190,29 @@ class BioPhysicsDataset(Dataset):
             if d1_full.empty or d2_full.empty:
                 return None, None, None, None, None
 
-            # Simple Pivot
-            p1 = d1_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
-            p2 = d2_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
+            # Fill Buffer (No 'frame' column dependency)
+            L_alloc = len(df)
+            raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+            raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-            # Align indices
-            common_index = p1.index.union(p2.index).sort_values()
-            p1 = p1.reindex(common_index).fillna(method='ffill').fillna(0)
-            p2 = p2.reindex(common_index).fillna(method='ffill').fillna(0)
-
-            raw_m1 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
-            raw_m2 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
+            max_len = 0
 
             for i, bp in enumerate(BODY_PARTS):
-                if ('x', bp) in p1.columns:
-                    raw_m1[:, i, 0] = p1[('x', bp)].values
-                    raw_m1[:, i, 1] = p1[('y', bp)].values
-                if ('x', bp) in p2.columns:
-                    raw_m2[:, i, 0] = p2[('x', bp)].values
-                    raw_m2[:, i, 1] = p2[('y', bp)].values
+                # Mouse 1
+                v1 = d1_full[d1_full['bodypart']==bp][['x', 'y']].values
+                if len(v1) > 0:
+                    raw_m1[:len(v1), i] = v1
+                    max_len = max(max_len, len(v1))
+
+                # Mouse 2
+                v2 = d2_full[d2_full['bodypart']==bp][['x', 'y']].values
+                if len(v2) > 0:
+                    raw_m2[:len(v2), i] = v2
+                    max_len = max(max_len, len(v2))
+
+            # Slice to actual max length
+            raw_m1 = raw_m1[:max_len]
+            raw_m2 = raw_m2[:max_len]
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)
@@ -219,7 +223,10 @@ class BioPhysicsDataset(Dataset):
 
             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, common_index.values
+            # Frames: Just indices since we don't have 'frame' column
+            frames = np.arange(max_len)
+
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
