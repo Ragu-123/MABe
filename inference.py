@@ -89,8 +89,8 @@ class BioPhysicsDataset(Dataset):
                         self.samples.append({
                             'video_id': vid,
                             'lab_id': lab,
-                            'agent_id': agent,
-                            'target_id': target
+                            'agent_id': str(agent), # FORCE STRING
+                            'target_id': str(target) # FORCE STRING
                         })
 
     def _fix_teleport(self, pos):
@@ -182,9 +182,10 @@ class BioPhysicsDataset(Dataset):
         try:
             df = pd.read_parquet(fpath)
 
-            # Identify Agents based on sample
-            d1_full = df[df['mouse_id']==agent_id]
-            d2_full = df[df['mouse_id']==target_id]
+            # Identify Agents based on sample with ROBUST TYPE CHECKING
+            df['mouse_id_str'] = df['mouse_id'].astype(str)
+            d1_full = df[df['mouse_id_str']==str(agent_id)]
+            d2_full = df[df['mouse_id_str']==str(target_id)]
 
             if d1_full.empty or d2_full.empty:
                 return None, None, None, None, None

@@ -225,6 +225,7 @@ class BioPhysicsDataset(Dataset):
 
     def _scan_actions_safe(self):
         count = 0
+        print("Scanning subset of annotations for sampling...")
         # Reduce scan size for speed
         for i, s in enumerate(self.samples):
             if i > 200: break
@@ -439,6 +440,11 @@ class BioPhysicsDataset(Dataset):
                 except: pass
         
         lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+
+        # DEBUG: Check signal (Moved after weights defined)
+        if data_loaded and self.print_count < self.print_limit and weights.sum() == 0:
+             print(f"[DEBUG] Weights are ZERO despite DataLoaded! Vid: {vid}, Frame range: {frame_start}-{frame_end}")
+             self.print_count += 1
 
         # Pack Metadata
         meta_info = {
@@ -1250,8 +1256,9 @@ def train_ethoswarm_v3():
     train_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=train_ids)
     val_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=val_ids)
     
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate_dual, num_workers=2)
+    # DEBUG: num_workers=0 to ensure prints show up
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate_dual, num_workers=0)
     
     # --- 3. MODEL INITIALIZATION ---
     model = EthoSwarmNet(num_classes=NUM_CLASSES, input_dim=128)
