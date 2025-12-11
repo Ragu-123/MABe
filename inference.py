@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import math
+import polars as pl
+import pyarrow.parquet as pq
 
 # ==============================================================================
 # 1. SHARED CONFIGURATION & DATA (Copied exactly from train.py)
@@ -92,6 +94,32 @@ class BioPhysicsDataset(Dataset):
                             'agent_id': str(agent), # FORCE STRING
                             'target_id': str(target) # FORCE STRING
                         })
+
+        # --- Filter Bad Samples ---
+        def _quick_parquet_has_frames(path):
+            try:
+                pf = pq.ParquetFile(str(path))
+                md = pf.metadata
+                if md.num_rows == 0:
+                    return False
+                try:
+                    col_names = pf.schema_arrow.names
+                    if 'video_frame' in col_names:
+                        return True
+                    return True
+                except:
+                    return True
+            except:
+                return False
+
+        print("Filtering invalid videos...")
+        filtered = []
+        for s in self.samples:
+            p = self.tracking_dir / s['lab_id'] / f"{s['video_id']}.parquet"
+            if p.exists() and _quick_parquet_has_frames(p):
+                filtered.append(s)
+        self.samples = filtered
+        print(f"Retained {len(self.samples)} valid samples.")
 
     def _fix_teleport(self, pos):
         T, N, _ = pos.shape
@@ -180,42 +208,51 @@ class BioPhysicsDataset(Dataset):
             return None, None, None, None, None
 
         try:
-            df = pd.read_parquet(fpath)
+            # Polars Optimization
+            lf = pl.scan_parquet(fpath)
 
-            # Robust Filter
-            df['mouse_id_str'] = df['mouse_id'].astype(str)
-            d1_full = df[df['mouse_id_str']==str(agent_id)]
-            d2_full = df[df['mouse_id_str']==str(target_id)]
+            # 1. Get Limits
+            meta_df = lf.select(pl.col('video_frame').max()).collect()
+            if meta_df.shape[0] == 0 or meta_df.item(0, 0) is None:
+                 return None, None, None, None, None
 
-            if d1_full.empty or d2_full.empty:
+            max_frame = meta_df.item(0, 0)
+            L_alloc = max_frame + 1
+
+            # 2. Fetch Data for this Pair
+            q = (
+                lf
+                .filter(
+                    pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)])
+                )
+                .collect()
+            )
+
+            if q.is_empty():
                 return None, None, None, None, None
 
-            # Use 'video_frame' column for correct indexing (0-based)
-            max_frame = df['video_frame'].max()
-            L_alloc = max_frame + 1
+            df = q.to_pandas()
 
             raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
             raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
+            # Mouse 1
+            d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
             for i, bp in enumerate(BODY_PARTS):
-                # Mouse 1
-                v1 = d1_full[d1_full['bodypart']==bp]
-                if not v1.empty:
-                    indices = v1['video_frame'].values
-                    vals = v1[['x', 'y']].values
-                    valid = indices < L_alloc
-                    raw_m1[indices[valid], i] = vals[valid]
+                rows = d1[d1['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
 
-                # Mouse 2
-                v2 = d2_full[d2_full['bodypart']==bp]
-                if not v2.empty:
-                    indices = v2['video_frame'].values
-                    vals = v2[['x', 'y']].values
-                    valid = indices < L_alloc
-                    raw_m2[indices[valid], i] = vals[valid]
-
-            # Buffer is now full size L_alloc (matching video length)
-            # No need to slice to 'max_len' if L_alloc is the video length.
+            # Mouse 2
+            d2 = df[df['mouse_id'].astype(str) == str(target_id)]
+            for i, bp in enumerate(BODY_PARTS):
+                rows = d2[d2['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)
