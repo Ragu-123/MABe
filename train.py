@@ -323,7 +323,7 @@ class BioPhysicsDataset(Dataset):
         b_label = sample['behaviors_labeled']
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
-        
+
         data_loaded = False
         frame_start = 0
         frame_end = 0
@@ -339,60 +339,76 @@ class BioPhysicsDataset(Dataset):
 
         if fpath.exists():
             try:
-                df = pd.read_parquet(fpath)
+                # OPTIMIZATION: Use Polars for lazy scanning and filtering
+                lf = pl.scan_parquet(fpath)
                 
-                # Robust ID Filtering
-                df['mouse_id_str'] = df['mouse_id'].astype(str)
-                df_a = df[df['mouse_id_str'] == str(agent_id)]
-                df_t = df[df['mouse_id_str'] == str(target_id)]
+                # 1. Get Limits (lazy)
+                # Fetch max frame to determine L
+                meta_df = lf.select(pl.col('video_frame').max()).collect()
+                if meta_df.shape[0] > 0 and meta_df.item(0, 0) is not None:
+                    max_frame = meta_df.item(0, 0)
+                    L = max_frame + 1
 
-                if not df_a.empty and not df_t.empty:
-                    # Use 'video_frame' column for correct indexing (0-based)
-                    # Note: We assume 'video_frame' exists based on user feedback.
-                    max_frame = df['video_frame'].max()
-                    L_alloc = max_frame + 1
+                    # 2. Pick Window
+                    if center is None: center = random.randint(0, L)
+                    s = max(0, min(center - self.local_window//2, L - self.local_window))
+                    e = min(s + self.local_window, L)
 
-                    full_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
-                    full_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+                    frame_start = s
+                    frame_end = e
 
-                    # Fill Buffer using video_frame index
-                    for i, bp in enumerate(BODY_PARTS):
+                    # 3. Filter and Fetch Window (Lazy evaluation pushes down filters)
+                    # Cast mouse_id to string for robustness
+                    q = (
+                        lf
+                        .filter(
+                            (pl.col('video_frame') >= s) &
+                            (pl.col('video_frame') < e) &
+                            (pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)]))
+                        )
+                        .collect()
+                    )
+
+                    # 4. Process into Buffers
+                    # If empty, data_loaded remains False
+                    if not q.is_empty():
+                        # Convert to pandas for easier numpy handling or handle directly
+                        df = q.to_pandas()
+
+                        # Prepare buffers - size is window length (e-s)
+                        # We map video_frame to buffer index: idx = video_frame - s
+                        win_len = e - s
+                        raw_m1 = np.zeros((win_len, 11, 2), dtype=np.float32)
+                        raw_m2 = np.zeros((win_len, 11, 2), dtype=np.float32)
+
                         # Mouse 1
-                        d1 = df_a[df_a['bodypart']==bp]
-                        if not d1.empty:
-                            indices = d1['video_frame'].values
-                            vals = d1[['x', 'y']].values
-                            # Safety check for indices bounds
-                            valid = indices < L_alloc
-                            full_m1[indices[valid], i] = vals[valid]
+                        d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
+                        for i, bp in enumerate(BODY_PARTS):
+                            rows = d1[d1['bodypart']==bp]
+                            if not rows.empty:
+                                indices = rows['video_frame'].values - s
+                                # Safety bounds
+                                valid = (indices >= 0) & (indices < win_len)
+                                raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
 
                         # Mouse 2
-                        d2 = df_t[df_t['bodypart']==bp]
-                        if not d2.empty:
-                            indices = d2['video_frame'].values
-                            vals = d2[['x', 'y']].values
-                            valid = indices < L_alloc
-                            full_m2[indices[valid], i] = vals[valid]
+                        d2 = df[df['mouse_id'].astype(str) == str(target_id)]
+                        for i, bp in enumerate(BODY_PARTS):
+                            rows = d2[d2['bodypart']==bp]
+                            if not rows.empty:
+                                indices = rows['video_frame'].values - s
+                                valid = (indices >= 0) & (indices < win_len)
+                                raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
 
-                    # Slice Window
-                    L = L_alloc
-                    if L > 0:
-                        if center is None: center = random.randint(0, L)
-                        s = max(0, min(center - self.local_window//2, L - self.local_window))
-                        e = min(s + self.local_window, L)
-
-                        frame_start = s
-                        frame_end = e
-
-                        raw_m1 = full_m1[s:e]
-                        raw_m2 = full_m2[s:e]
                         data_loaded = True
                     else:
-                        debug_msg = "Zero length sequence from video_frame."
+                        debug_msg = f"Empty window query. Vid: {vid}, Range: {s}-{e}"
                 else:
-                    debug_msg = f"Empty filter. Found: {df['mouse_id'].unique()}"
+                    debug_msg = "Empty video_frame column or file."
             except Exception as e:
                 debug_msg = f"Load Error: {e}"
+                # import traceback
+                # traceback.print_exc()
         else:
             debug_msg = f"File not found: {fpath}"
 
@@ -1268,9 +1284,8 @@ def train_ethoswarm_v3():
     train_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=train_ids)
     val_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=val_ids)
     
-    # DEBUG: num_workers=0 to ensure prints show up
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate_dual, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate_dual, num_workers=2)
     
     # --- 3. MODEL INITIALIZATION ---
     model = EthoSwarmNet(num_classes=NUM_CLASSES, input_dim=128)
