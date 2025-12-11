@@ -60,18 +60,38 @@ class BioPhysicsDataset(Dataset):
 
         # Load Metadata
         self.metadata = pd.read_csv(self.root / f"{mode}.csv")
-
-        # Filter Video IDs
         if video_ids is not None:
             self.metadata = self.metadata[self.metadata['video_id'].astype(str).isin(video_ids)]
 
-        # Build samples strictly from metadata to ensure processing order
+        # Build samples for ALL permutations
         self.samples = []
+        print(f"Scanning {len(self.metadata)} videos for mouse pairs...")
+
+        # Scan videos for mice
         for _, row in self.metadata.iterrows():
-            self.samples.append({
-                'video_id': str(row['video_id']),
-                'lab_id': row['lab_id']
-            })
+            vid = str(row['video_id'])
+            lab = row['lab_id']
+            fpath = self.tracking_dir / lab / f"{vid}.parquet"
+            mice = []
+            if fpath.exists():
+                try:
+                    df_small = pd.read_parquet(fpath, columns=['mouse_id'])
+                    mice = df_small['mouse_id'].unique().tolist()
+                except:
+                    mice = ['mouse1', 'mouse2']
+            else:
+                mice = []
+
+            # Create permutations
+            for agent in mice:
+                for target in mice:
+                    if agent != target:
+                        self.samples.append({
+                            'video_id': vid,
+                            'lab_id': lab,
+                            'agent_id': agent,
+                            'target_id': target
+                        })
 
     def _fix_teleport(self, pos):
         T, N, _ = pos.shape
@@ -142,43 +162,34 @@ class BioPhysicsDataset(Dataset):
 
         return feat.astype(np.float32)
 
-    def load_full_video_features(self, idx):
+    def load_full_video_features_for_pair(self, idx):
         """
-        Loads the FULL video features for sliding window inference.
-        Returns: (feats, lab_idx, agent_id, target_id)
+        Loads the FULL video features for sliding window inference for a SPECIFIC pair.
+        Returns: (feats, lab_idx, agent_id, target_id, frames)
         """
         sample = self.samples[idx]
         lab = sample['lab_id']
         vid = sample['video_id']
+        agent_id = sample['agent_id']
+        target_id = sample['target_id']
         conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
         if not fpath.exists():
-            return None, None, None, None
+            return None, None, None, None, None
 
         try:
             df = pd.read_parquet(fpath)
-            mids = df['mouse_id'].unique()
 
-            # Identify Agents
-            m1_id = mids[0]
-            m2_id = mids[1] if len(mids) > 1 else m1_id # Handle single mouse case
+            # Identify Agents based on sample
+            d1_full = df[df['mouse_id']==agent_id]
+            d2_full = df[df['mouse_id']==target_id]
 
-            L = len(df) // len(mids) # approx length
-            # Better way: get max frame
-            # Or just filter by mouse
-
-            d1_full = df[df['mouse_id']==m1_id]
-            d2_full = df[df['mouse_id']==m2_id]
-
-            # Pivot to [T, 11, 2]
-            # Assumes 'bodypart' column exists
-            # We need to ensure frames are aligned.
-            # Reindex by frame.
+            if d1_full.empty or d2_full.empty:
+                return None, None, None, None, None
 
             # Simple Pivot
-            # (In production, use Polars or optimized pandas pivot)
             p1 = d1_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
             p2 = d2_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
 
@@ -207,11 +218,11 @@ class BioPhysicsDataset(Dataset):
 
             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
-            return torch.tensor(feats), lab_idx, m1_id, m2_id, common_index.values
+            return torch.tensor(feats), lab_idx, agent_id, target_id, common_index.values
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None
+            return None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -321,6 +332,8 @@ class LocalGlobalChronosEncoder(nn.Module):
         self.pos_encoder = PositionalEncoding(hidden_dim, max_len=5000)
         global_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, dim_feedforward=512, batch_first=True, dropout=0.1, activation="gelu")
         self.global_transformer = nn.TransformerEncoder(global_layer, num_layers=2)
+        # AUX HEAD
+        self.global_classifier = nn.Linear(hidden_dim, 37)
 
         self.self_tcn = nn.Sequential(
             nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1), nn.BatchNorm1d(hidden_dim), nn.GELU(),
@@ -345,6 +358,8 @@ class LocalGlobalChronosEncoder(nn.Module):
         g_emb = self.pos_encoder(g_emb)
         global_memory = self.global_transformer(g_emb)
 
+        g_logits = self.global_classifier(global_memory)
+
         s_in = local_self.permute(0, 2, 1)
         s_tcn = self.self_tcn(s_in).permute(0, 2, 1)
         s_tcn = self.self_local_attn(s_tcn)
@@ -357,7 +372,7 @@ class LocalGlobalChronosEncoder(nn.Module):
         p_ctx, _ = self.pair_attn(query=p_tcn, key=global_memory, value=global_memory)
         pair_out = self.pair_norm(p_tcn + p_ctx)
 
-        return self_out, pair_out
+        return self_out, pair_out, g_logits
 
 class MultiTaskLogicHead(nn.Module):
     def __init__(self, input_dim=128, num_labs=20):
@@ -410,13 +425,13 @@ class EthoSwarmNet(nn.Module):
         g_out, _, _ = self.morph_core(global_agent, global_target, lab_idx)
         _, l_ac, l_tc = self.morph_core(local_agent, local_target, lab_idx)
         l_self, l_pair = self.split_interaction(l_ac, l_tc, role_indices=role_idx)
-        t_self, t_pair = self.chronos(g_out, l_self, l_pair)
-        p_self, p_pair, _ = self.logic_head(t_self, t_pair, lab_idx, l_ac, l_tc)
+        t_self, t_pair, g_logits = self.chronos(g_out, l_self, l_pair)
+        p_self, p_pair, center_score = self.logic_head(t_self, t_pair, lab_idx, l_ac, l_tc)
         batch, time, _ = p_self.shape
         final_output = torch.zeros(batch, time, 37, device=p_self.device, dtype=p_self.dtype)
         final_output.index_copy_(2, self.self_indices, p_self)
         final_output.index_copy_(2, self.pair_indices, p_pair)
-        return final_output
+        return final_output, center_score, g_logits
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
@@ -465,54 +480,15 @@ def run_inference():
 
     print(f"Starting Inference on {len(ds)} samples...")
     for i in range(len(ds)):
-        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features(i)
+        # New Pair-Based Loader
+        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features_for_pair(i)
 
         if feats is None: continue
 
         # Prepare Tensors
-        # feats: [Total_Frames, 11, 16]
         T_total = len(feats)
-
-        # Accumulators for blending
-        # [T_total, 37]
         prob_accum = torch.zeros((T_total, 37), device=DEVICE)
         count_accum = torch.zeros((T_total, 37), device=DEVICE)
-
-        # Sliding Window
-        # We need batches for speed? Or just loop over chunks?
-        # Loop chunks is safer for memory.
-
-        for start in range(0, T_total, STRIDE):
-            end = min(start + WINDOW_SIZE, T_total)
-            length = end - start
-
-            # Slice
-            chunk = feats[start:end].unsqueeze(0).to(DEVICE) # [1, L, 11, 16]
-
-            # Pad if needed (must be at least window size for TCN padding?)
-            # Actually TCN uses 'same' padding logic usually, but let's check.
-            # Our TCN has padding=1/2/4/8/16. Max dilation 16.
-            # Min length needed is small, but let's pad to be safe if very short.
-
-            # Forward
-            with torch.no_grad():
-                # Global Context: Downsample to 1 FPS (approx every 30 frames)
-                # chunk shape [1, L, 11, 16]
-                # Global needs [1, T_g, 128] ? No, Global takes feats?
-                # Wait, train loop passed 'gx' (raw feats) to model.
-                # Model expects (gx, gx, lx, lx, lid).
-
-                # Global Feats: We should pass the whole chunk as "global" for itself?
-                # Ideally Global Context is the *whole video*.
-                # But whole video fits in memory?
-                # feats is [T_total, 11, 16].
-                # If T=30,000, 11*16*30000 * 4 bytes ~ 20MB. Fits easily.
-
-                # Strategy:
-                # 1. Compute Global Context for WHOLE video ONCE.
-                # 2. Pass window for Local.
-
-                pass
 
         # REVISED STRATEGY FOR SPEED/ACCURACY
         # 1. Compute Global Embedding for entire video (subsampled)
@@ -520,7 +496,7 @@ def run_inference():
 
         # Subsample for Global Stream (every 30th frame ~ 1FPS)
         g_input = g_feats_full[:, ::30, :, :]
-        if g_input.shape[1] == 0: g_input = g_feats_full # Fallback short video
+        if g_input.shape[1] == 0: g_input = g_feats_full
 
         # 2. Loop Windows for Local
         for start in range(0, T_total, STRIDE):
@@ -530,7 +506,8 @@ def run_inference():
             lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
 
             with torch.no_grad():
-                 probs = model(g_input, g_input, l_input, l_input, lid_tensor)
+                 # Forward returns 3 items, unpack
+                 probs, _, _ = model(g_input, g_input, l_input, l_input, lid_tensor)
                  # probs: [1, L, 37]
 
             prob_accum[start:end] += probs[0]
@@ -540,12 +517,10 @@ def run_inference():
         final_probs = prob_accum / (count_accum + 1e-6)
 
         # Thresholding
-        # Apply per-class thresholds
         preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
 
         # Generate Submission Rows
-        # Format: video_id, agent, target, action, start, end
-        # RLE Encoding
+        vid = ds.samples[i]['video_id']
 
         for c in range(37):
             action_name = ACTION_LIST[c]
@@ -557,35 +532,25 @@ def run_inference():
             stops = np.where(diffs == -1)[0]
 
             for s, e in zip(starts, stops):
-                # Apply Frame Index
                 real_start = frames[s]
-                real_stop = frames[e-1] # inclusive?
-                # Competition: start_frame, stop_frame
+                real_stop = frames[e-1]
 
                 # Resolve Target ID
-                # If action is 'Self', target is 'self' (implied?)
-                # Actually submission requires explicit target ID usually.
-                # Reference: "mouse1", "self" or "mouse2".
-
-                # Check if pair behavior
                 final_target = target_id
                 if action_name in SELF_BEHAVIORS:
-                    final_target = 'self' # Or 'self'? Check format.
-                    # Reference used "self" string.
+                    final_target = 'self'
                 else:
-                    # Pair behavior
-                    # If target_id is same as agent_id (single mouse?), this logic fails.
-                    if target_id == agent_id: final_target = 'self' # Should not happen in pair
+                    if target_id == agent_id: final_target = 'self'
 
-                # Format: "mouse1", "mouse2"
-                ag_str = f"mouse{agent_id}"
+                # Format
+                ag_str = f"mouse{agent_id}" if isinstance(agent_id, int) else agent_id
                 if final_target == 'self':
                     tg_str = 'self'
                 else:
-                    tg_str = f"mouse{final_target}"
+                    tg_str = f"mouse{final_target}" if isinstance(final_target, int) else final_target
 
                 submission_rows.append([
-                     i, # Row ID placeholder
+                     0, # Row ID placeholder
                      vid,
                      ag_str,
                      tg_str,
