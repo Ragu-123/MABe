@@ -173,13 +173,14 @@ class BioPhysicsDataset(Dataset):
         # 4. Dynamics
         # Velocity
         vel = np.diff(centered, axis=0, prepend=centered[0:1])
-        speed = np.sqrt((vel**2).sum(axis=-1))
-        
+        # Fix NaNs: maximum(0) before sqrt
+        speed = np.sqrt(np.maximum((vel**2).sum(axis=-1), 0))
+
         # Acceleration
         acc = np.diff(vel, axis=0, prepend=vel[0:1])
 
         # 5. Relation
-        dist = np.sqrt(((centered - other_centered)**2).sum(axis=-1))
+        dist = np.sqrt(np.maximum(((centered - other_centered)**2).sum(axis=-1), 0))
         
         # Pack to 8 Channels
         # [Pos X, Pos Y, Vel X, Vel Y, Speed, Dist, Acc X, Acc Y]
@@ -190,6 +191,9 @@ class BioPhysicsDataset(Dataset):
             acc[...,0], acc[...,1]
         ], axis=-1)
         
+        # Final NaN Safety
+        feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+
         return feat.astype(np.float32)
 
     def _load(self, idx, center=None):
