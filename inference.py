@@ -236,6 +236,10 @@ class BioPhysicsDataset(Dataset):
             raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
             raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
+            # Validity Masks
+            valid_m1 = np.zeros(L_alloc, dtype=bool)
+            valid_m2 = np.zeros(L_alloc, dtype=bool)
+
             # Mouse 1
             d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
             for i, bp in enumerate(BODY_PARTS):
@@ -244,6 +248,7 @@ class BioPhysicsDataset(Dataset):
                     indices = rows['video_frame'].values
                     valid = (indices >= 0) & (indices < L_alloc)
                     raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m1[indices[valid]] = True
 
             # Mouse 2
             d2 = df[df['mouse_id'].astype(str) == str(target_id)]
@@ -253,6 +258,10 @@ class BioPhysicsDataset(Dataset):
                     indices = rows['video_frame'].values
                     valid = (indices >= 0) & (indices < L_alloc)
                     raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m2[indices[valid]] = True
+
+            # Intersection of presence
+            valid_frames = valid_m1 & valid_m2
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)
@@ -266,7 +275,7 @@ class BioPhysicsDataset(Dataset):
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, frames
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
@@ -529,7 +538,7 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i in range(len(ds)):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features_for_pair(i)
+        feats, lab_idx, agent_id, target_id, frames, valid_mask = ds.load_full_video_features_for_pair(i)
 
         if feats is None: continue
 
@@ -549,6 +558,12 @@ def run_inference():
         # 2. Loop Windows for Local
         for start in range(0, T_total, STRIDE):
             end = min(start + WINDOW_SIZE, T_total)
+
+            # Skip empty windows (no tracking data)
+            # Training only samples centers where data exists.
+            # Inference should mimic this by skipping windows with NO valid data.
+            if not valid_mask[start:end].any():
+                continue
 
             l_input = g_feats_full[:, start:end, :, :]
             lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
