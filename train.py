@@ -489,9 +489,13 @@ class BioPhysicsDataset(Dataset):
             if ap.exists():
                 try:
                     adf = pd.read_parquet(ap)
-                    if 'agent' in adf.columns and 'target' in adf.columns:
+                    # Determine filter columns (agent vs agent_id)
+                    aid_col = 'agent_id' if 'agent_id' in adf.columns else 'agent'
+                    tid_col = 'target_id' if 'target_id' in adf.columns else 'target'
+
+                    if aid_col in adf.columns and tid_col in adf.columns:
                          # Filter
-                         adf = adf[(adf['agent'] == agent_id) & (adf['target'] == target_id)]
+                         adf = adf[(adf[aid_col] == agent_id) & (adf[tid_col] == target_id)]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
@@ -1432,14 +1436,19 @@ def train_ethoswarm_v3():
                 pair_adf = []
                 for a_row in video_gt_actions:
                     # Robust check for agent/target columns (pandas Series / dict)
-                    # We cast to string to match agent_id (str)
-                    if 'agent' in a_row and 'target' in a_row:
-                        if str(a_row['agent']) == agent_id and str(a_row['target']) == target_id:
+                    # Handles both 'agent' and 'agent_id' variants seen in data
+                    aid_val = None
+                    tid_val = None
+
+                    if 'agent_id' in a_row: aid_val = a_row['agent_id']
+                    elif 'agent' in a_row: aid_val = a_row['agent']
+
+                    if 'target_id' in a_row: tid_val = a_row['target_id']
+                    elif 'target' in a_row: tid_val = a_row['target']
+
+                    if aid_val is not None and tid_val is not None:
+                        if str(aid_val) == agent_id and str(tid_val) == target_id:
                             pair_adf.append(a_row)
-                    else:
-                        # Fallback: if no columns, maybe single animal or assumed pair?
-                        # But MABe usually specifies. We skip if ambiguous to match training.
-                        pass
 
                 for a_row in pair_adf:
                     solution_rows.append({
