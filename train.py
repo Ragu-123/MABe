@@ -493,9 +493,13 @@ class BioPhysicsDataset(Dataset):
                     aid_col = 'agent_id' if 'agent_id' in adf.columns else 'agent'
                     tid_col = 'target_id' if 'target_id' in adf.columns else 'target'
 
+                    # Determine filter columns (agent vs agent_id)
+                    aid_col = 'agent_id' if 'agent_id' in adf.columns else 'agent'
+                    tid_col = 'target_id' if 'target_id' in adf.columns else 'target'
+
                     if aid_col in adf.columns and tid_col in adf.columns:
-                         # Filter
-                         adf = adf[(adf[aid_col] == agent_id) & (adf[tid_col] == target_id)]
+                         # Filter with explicit string casting for robustness
+                         adf = adf[(adf[aid_col].astype(str) == str(agent_id)) & (adf[tid_col].astype(str) == str(target_id))]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
