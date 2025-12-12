@@ -614,44 +614,89 @@ def run_inference():
         # Average
         final_probs = prob_accum / (count_accum + 1e-6)
 
-        # Thresholding
-        preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
+        # Post-Processing: Single Action Selection + Lab Masking
 
-        # Generate Submission Rows
-        vid = ds.samples[i]['video_id']
+        # 1. Apply Lab Mask
+        if lab_idx < len(lab_masks):
+            mask = lab_masks[lab_idx].unsqueeze(0)
+            final_probs = final_probs * mask
 
-        for c in range(37):
-            action_name = ACTION_LIST[c]
-            binary_seq = preds[:, c]
+        # 2. Select Single Best Action per Frame (Argmax)
+        # probs: [T, 37]
+        # We use a global threshold for "background" (no action)
+        GLOBAL_THRESH = 0.4
 
-            # RLE
-            diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
-            starts = np.where(diffs == 1)[0]
-            stops = np.where(diffs == -1)[0]
+        best_probs, best_idx = torch.max(final_probs, dim=1) # [T]
 
-            for s, e in zip(starts, stops):
-                real_start = frames[s]
-                real_stop = frames[e-1]
+        # Filter weak predictions
+        valid_frames = best_probs > GLOBAL_THRESH
 
-                # Resolve Target ID
-                final_target = target_id
-                if action_name in SELF_BEHAVIORS:
-                    final_target = 'self'
-                else:
-                    if target_id == agent_id: final_target = 'self'
+        pred_indices = best_idx.cpu().numpy()
+        valid_mask_np = valid_frames.cpu().numpy()
 
-                # Format
-                ag_str = f"mouse{agent_id}" if isinstance(agent_id, int) else agent_id
-                if final_target == 'self':
-                    tg_str = 'self'
-                else:
-                    tg_str = f"mouse{final_target}" if isinstance(final_target, int) else final_target
+        # Generate Segments
+        # We iterate through time and group consecutive identical predictions
 
+        current_action = None
+        start_f = 0
+
+        # We'll use a simple loop over T_total
+        for t in range(T_total):
+            if not valid_mask_np[t]:
+                label = -1 # Background
+            else:
+                label = pred_indices[t]
+
+            if label != current_action:
+                # Close previous segment
+                if current_action is not None and current_action != -1:
+                    stop_f = t # Exclusive stop
+
+                    real_start = frames[start_f]
+                    # frames array might be padded or offset?
+                    # frames is np.arange(L_alloc) from loader, so it maps directly.
+                    # Safety check
+                    if stop_f > len(frames): stop_f = len(frames)
+                    if start_f >= len(frames): continue # Should not happen if T_total matches
+
+                    real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
+
+                    # Store
+                    action_name = ACTION_LIST[current_action]
+
+                    # Resolve Target ID (Logic from original)
+                    final_target = target_id
+                    # Standardize MABe format: usually just raw agent/target IDs
+                    # We use the string versions directly from sample
+
+                    submission_rows.append([
+                         0,
+                         vid,
+                         str(agent_id),
+                         str(final_target),
+                         action_name,
+                         real_start,
+                         real_stop
+                    ])
+
+                # Start new
+                current_action = label
+                start_f = t
+
+        # Close final segment
+        if current_action is not None and current_action != -1:
+            stop_f = T_total
+            if start_f < len(frames):
+                if stop_f > len(frames): stop_f = len(frames)
+                real_start = frames[start_f]
+                real_stop = frames[stop_f-1] + 1
+
+                action_name = ACTION_LIST[current_action]
                 submission_rows.append([
-                     0, # Row ID placeholder
+                     0,
                      vid,
-                     ag_str,
-                     tg_str,
+                     str(agent_id),
+                     str(target_id),
                      action_name,
                      real_start,
                      real_stop
