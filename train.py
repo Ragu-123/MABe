@@ -334,6 +334,10 @@ class BioPhysicsDataset(Dataset):
                 try:
                     df = pd.read_parquet(p)
                     # Find centers
+                    # Relaxed scanning: Don't filter by agent_id here to avoid empty action_windows due to ID mismatch.
+                    # We will filter strictly in _load() to assign correct targets.
+                    # This ensures we get candidate windows even if metadata matching is imperfect.
+
                     df = df[df['action'].isin(ACTION_TO_IDX)]
                     if not df.empty:
                         for c in ((df['start_frame'] + df['stop_frame']) // 2).values:
