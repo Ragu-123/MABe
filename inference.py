@@ -669,100 +669,42 @@ def run_inference():
             mask = lab_masks[lab_idx].unsqueeze(0) # [1, 37]
             final_probs = final_probs * mask
 
-        # 2. Select Single Best Action per Frame (Argmax)
-        # probs: [T, 37]
-        # We use a global threshold for "background" (no action)
-        GLOBAL_THRESH = 0.4
+        # 2. Multi-Label Thresholding (Matches train.py validation)
+        # Using per-class thresholds loaded from JSON
+        # final_probs: [T, 37], thresholds: [37]
 
-        best_probs, best_idx = torch.max(final_probs, dim=1) # [T]
+        preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy() # [T, 37]
 
-        # Filter weak predictions
-        valid_frames = best_probs > GLOBAL_THRESH
+        # Generate Segments per Class
+        for c in range(NUM_CLASSES):
+            action_name = ACTION_LIST[c]
+            binary_seq = preds[:, c]
 
-        pred_indices = best_idx.cpu().numpy()
-        valid_mask_np = valid_frames.cpu().numpy()
+            # Find contiguous segments
+            diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
+            starts_seg = np.where(diffs == 1)[0]
+            stops_seg = np.where(diffs == -1)[0]
 
-        # Generate Segments
-        # We iterate through time and group consecutive identical predictions
+            for s, e in zip(starts_seg, stops_seg):
+                # Map local indices s, e to real frames
+                # s is start index (inclusive), e is stop index (exclusive in local 0..T)
 
-        current_action = None
-        start_f = 0
+                # Safety check for boundaries
+                if s >= len(frames): continue
+                if e > len(frames): e = len(frames)
 
-        # We'll use a simple loop over T_total
-        for t in range(T_total):
-            if not valid_mask_np[t]:
-                label = -1 # Background
-            else:
-                label = pred_indices[t]
+                real_start = frames[s]
+                # frames[e-1] is the last included frame. +1 makes it exclusive.
+                real_stop = frames[e-1] + 1
 
-            if label != current_action:
-                # Close previous segment
-                if current_action is not None and current_action != -1:
-                    stop_f = t # Exclusive stop
-
-                    real_start = frames[start_f]
-                    # frames array might be padded or offset?
-                    # frames is np.arange(L_alloc) from loader, so it maps directly.
-                    # Safety check
-                    if stop_f > len(frames): stop_f = len(frames)
-                    if start_f >= len(frames): continue # Should not happen if T_total matches
-
-                    # real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
-                    # Wait, if frames is [0, 1, 2] and stop_f=3 (exclusive index in local),
-                    # stop_f-1 = 2. frames[2] = 2.
-                    # +1 -> 3. Range 0..3 -> 0, 1, 2. Correct.
-                    # The user comment says "stop_frame = e".
-                    # In my train loop I used e directly because e was derived from indices.
-                    # Here frames is a lookup.
-                    # If I change +1 logic, I might break it.
-                    # User says: "mouse_fbeta uses range(start_frame, stop_frame) (stop exclusive). In your segment builder you set stop_frame = e-1. If mouse_fbeta expects exclusive stops, you should write stop_frame = e."
-                    # In this code: stop_f IS 'e'.
-                    # So frames[stop_f-1] is the last *included* frame.
-                    # +1 makes it exclusive.
-                    # So this logic seems CORRECT for exclusive stops.
-                    # I will keep it as is but double check comments.
-
-                    real_stop = frames[stop_f-1] + 1
-
-                    # Store
-                    action_name = ACTION_LIST[current_action]
-
-                    # Resolve Target ID (Logic from original)
-                    final_target = target_id
-                    # Standardize MABe format: usually just raw agent/target IDs
-                    # We use the string versions directly from sample
-
-                    submission_rows.append([
-                         0,
-                         vid,
-                         str(agent_id),
-                         str(final_target),
-                         action_name,
-                         real_start,
-                         real_stop
-                    ])
-
-                # Start new
-                current_action = label
-                start_f = t
-
-        # Close final segment
-        if current_action is not None and current_action != -1:
-            stop_f = T_total
-            if start_f < len(frames):
-                if stop_f > len(frames): stop_f = len(frames)
-                real_start = frames[start_f]
-                real_stop = frames[stop_f-1] + 1
-
-                action_name = ACTION_LIST[current_action]
                 submission_rows.append([
-                     0,
-                     vid,
-                     str(agent_id),
-                     str(target_id),
-                     action_name,
-                     real_start,
-                     real_stop
+                        0,
+                        vid,
+                        str(agent_id),
+                        str(target_id),
+                        action_name,
+                        real_start,
+                        real_stop
                 ])
 
     # Create DF
