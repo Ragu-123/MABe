@@ -499,6 +499,31 @@ class EthoSwarmNet(nn.Module):
         return final_output, center_score, g_logits
 
 # ==============================================================================
+# UTILS (Copied from train.py)
+# ==============================================================================
+def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
+    """
+    Loads a boolean mask [20, 37] where 1.0 means the lab annotates that action.
+    """
+    if not os.path.exists(vocab_path):
+        return torch.ones(25, 37).to(device)
+
+    with open(vocab_path, 'r') as f:
+        vocab = json.load(f)
+
+    lab_names = sorted(list(LAB_CONFIGS.keys()))
+    mask = torch.zeros(len(lab_names), num_classes).to(device)
+
+    for i, name in enumerate(lab_names):
+        if name in vocab:
+            for a in vocab[name]:
+                if a in action_to_idx:
+                    mask[i, action_to_idx[a]] = 1.0
+        else:
+            mask[i, :] = 1.0
+    return mask
+
+# ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
 # ==============================================================================
 def run_inference():
@@ -533,6 +558,14 @@ def run_inference():
         print("No weights found! Inference will be random.")
 
     model.eval()
+
+    # Load Masks
+    VOCAB_PATH = '/kaggle/input/mabe-metadata/results/lab_vocabulary.json'
+    # Fallback to local if running offline/differently
+    if not os.path.exists(VOCAB_PATH):
+        VOCAB_PATH = "lab_vocabulary.json"
+
+    lab_masks = load_lab_vocabulary(VOCAB_PATH, ACTION_TO_IDX, NUM_CLASSES, DEVICE)
 
     # 3. Data
     ds = BioPhysicsDataset(DATA_PATH, 'test')
@@ -617,8 +650,9 @@ def run_inference():
         # Post-Processing: Single Action Selection + Lab Masking
 
         # 1. Apply Lab Mask
+        # Note: lab_masks is [20, 37]. final_probs is [T, 37].
         if lab_idx < len(lab_masks):
-            mask = lab_masks[lab_idx].unsqueeze(0)
+            mask = lab_masks[lab_idx].unsqueeze(0) # [1, 37]
             final_probs = final_probs * mask
 
         # 2. Select Single Best Action per Frame (Argmax)
@@ -659,7 +693,22 @@ def run_inference():
                     if stop_f > len(frames): stop_f = len(frames)
                     if start_f >= len(frames): continue # Should not happen if T_total matches
 
-                    real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
+                    # real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
+                    # Wait, if frames is [0, 1, 2] and stop_f=3 (exclusive index in local),
+                    # stop_f-1 = 2. frames[2] = 2.
+                    # +1 -> 3. Range 0..3 -> 0, 1, 2. Correct.
+                    # The user comment says "stop_frame = e".
+                    # In my train loop I used e directly because e was derived from indices.
+                    # Here frames is a lookup.
+                    # If I change +1 logic, I might break it.
+                    # User says: "mouse_fbeta uses range(start_frame, stop_frame) (stop exclusive). In your segment builder you set stop_frame = e-1. If mouse_fbeta expects exclusive stops, you should write stop_frame = e."
+                    # In this code: stop_f IS 'e'.
+                    # So frames[stop_f-1] is the last *included* frame.
+                    # +1 makes it exclusive.
+                    # So this logic seems CORRECT for exclusive stops.
+                    # I will keep it as is but double check comments.
+
+                    real_stop = frames[stop_f-1] + 1
 
                     # Store
                     action_name = ACTION_LIST[current_action]

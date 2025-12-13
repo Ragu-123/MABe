@@ -46,9 +46,8 @@ def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta
         predicted_mouse_pairs: defaultdict[str, set[int]] = defaultdict(set)
 
         for row in lab_submission.filter(pl.col('video_id') == video).to_dicts():
-            # REMOVED FILTER: We now evaluate all predictions regardless of metadata
-            # if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
-            #     continue
+            if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
+                continue
 
             new_frames = set(range(row['start_frame'], row['stop_frame']))
             if row['prediction_key'] in prediction_frames:
@@ -1644,6 +1643,18 @@ def train_ethoswarm_v3():
         for i, (final_probs_np) in enumerate(all_val_probs):
              vid, agent_id, target_id = all_val_meta[i]
 
+             # Apply Lab Masking logic before thresholding
+             # We need to recover lab_idx. We can get it from metadata if we stored it, or look it up.
+             # Ideally we should have stored lab_idx in all_val_meta.
+             # Re-lookup lab_id from video_id
+             row = meta[meta['video_id'].astype(str) == vid].iloc[0]
+             lab = row['lab_id']
+             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+
+             if lab_idx < len(lab_masks):
+                  mask = lab_masks[lab_idx].cpu().numpy()
+                  final_probs_np = final_probs_np * mask
+
              preds = (final_probs_np > final_thresholds).astype(int)
 
              # Segments
@@ -1661,7 +1672,7 @@ def train_ethoswarm_v3():
                             'target_id': target_id,
                             'action': action_name,
                             'start_frame': s,
-                            'stop_frame': e-1
+                            'stop_frame': e # Exclusive stop (fixed)
                     })
 
         # CALCULATE METRIC
