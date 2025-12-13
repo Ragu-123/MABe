@@ -205,7 +205,7 @@ class BioPhysicsDataset(Dataset):
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
         if not fpath.exists():
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         try:
             # Polars Optimization
@@ -275,11 +275,11 @@ class BioPhysicsDataset(Dataset):
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames, vid
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -538,21 +538,35 @@ def run_inference():
 
     # 1. Load Thresholds
     thresholds = torch.ones(37).to(DEVICE) * 0.4
-    if os.path.exists("thresholds.json"):
-        with open("thresholds.json", "r") as f:
+
+    # Check paths as requested
+    THRESH_PATH = "/kaggle/input/mabe-separated/thresholds.json"
+    if not os.path.exists(THRESH_PATH):
+        THRESH_PATH = "thresholds.json"
+
+    if os.path.exists(THRESH_PATH):
+        with open(THRESH_PATH, "r") as f:
             th_list = json.load(f)
             thresholds = torch.tensor(th_list).to(DEVICE)
-        print("Loaded Optimized Thresholds.")
+        print(f"Loaded Optimized Thresholds from {THRESH_PATH}")
+    else:
+        print(f"Warning: thresholds not found at {THRESH_PATH}, using defaults.")
 
     # 2. Load Model
     model = EthoSwarmNet(num_classes=NUM_CLASSES)
     model.to(DEVICE)
 
-    # Load Weights (Latest)
-    weights = sorted([f for f in os.listdir(".") if f.startswith("ethoswarm_v4_ep")])
-    if weights:
-        print(f"Loading weights: {weights[-1]}")
-        state = torch.load(weights[-1], map_location=DEVICE)
+    # Weights Path
+    MODEL_PATH = "/kaggle/input/mabe-separated/ethoswarm_v4_ep10.pth"
+    if not os.path.exists(MODEL_PATH):
+        # Fallback to local
+        local_weights = sorted([f for f in os.listdir(".") if f.startswith("ethoswarm_v4_ep")])
+        if local_weights:
+            MODEL_PATH = local_weights[-1]
+
+    if os.path.exists(MODEL_PATH):
+        print(f"Loading weights from: {MODEL_PATH}")
+        state = torch.load(MODEL_PATH, map_location=DEVICE)
         model.load_state_dict(state)
     else:
         print("No weights found! Inference will be random.")
@@ -583,7 +597,7 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames, valid_mask = batch_data
+        feats, lab_idx, agent_id, target_id, frames, valid_mask, vid = batch_data
 
         if feats is None: continue
 
