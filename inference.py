@@ -650,6 +650,10 @@ def run_inference():
 
             lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
 
+            # Safety: Handle NaNs in inputs
+            gx_batch = torch.nan_to_num(gx_batch, nan=0.0)
+            lx_batch = torch.nan_to_num(lx_batch, nan=0.0)
+
             with torch.no_grad():
                 probs, _, _ = model(gx_batch, gx_batch, lx_batch, lx_batch, lid_batch)
 
@@ -672,6 +676,18 @@ def run_inference():
             mask = lab_masks[lab_idx].unsqueeze(0) # [1, 37]
             final_probs = final_probs * mask
 
+        # OPTIMIZATION: Temporal Smoothing (Reducing Flicker)
+        # Simple Moving Average (window=5)
+        # final_probs: [T, 37]
+        if T_total > 5:
+            # Add batch dim for conv1d: [1, 37, T]
+            probs_t = final_probs.permute(1, 0).unsqueeze(0)
+            # Kernel: [37, 1, 5] (Depthwise)
+            kernel = torch.ones(37, 1, 5).to(DEVICE) / 5.0
+            # Padding=2 to maintain size
+            probs_smoothed = F.conv1d(probs_t, kernel, padding=2, groups=37)
+            final_probs = probs_smoothed.squeeze(0).permute(1, 0) # [T, 37]
+
         # 2. Multi-Label Thresholding (Matches train.py validation)
         # Using per-class thresholds loaded from JSON
         # final_probs: [T, 37], thresholds: [37]
@@ -689,6 +705,11 @@ def run_inference():
             stops_seg = np.where(diffs == -1)[0]
 
             for s, e in zip(starts_seg, stops_seg):
+                # Optimization: Filter out short segments (Noise)
+                # Duration < 2 frames is likely noise
+                if (e - s) < 2:
+                    continue
+
                 # Map local indices s, e to real frames
                 # s is start index (inclusive), e is stop index (exclusive in local 0..T)
 
@@ -711,11 +732,17 @@ def run_inference():
                 ])
 
     # Create DF
-    df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    if not submission_rows:
+        # Edge Case: No predictions
+        # Create empty DF with correct columns
+        df_sub = pd.DataFrame(columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    else:
+        df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
 
     # Sort and re-index
-    df_sub = df_sub.sort_values(['video_id', 'start_frame'])
-    df_sub['row_id'] = np.arange(len(df_sub))
+    if not df_sub.empty:
+        df_sub = df_sub.sort_values(['video_id', 'start_frame'])
+        df_sub['row_id'] = np.arange(len(df_sub))
 
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
