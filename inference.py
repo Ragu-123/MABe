@@ -551,6 +551,13 @@ def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
 # ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
 # ==============================================================================
+def normalize_id(mid):
+    """Normalize mouse ID to match competition format (e.g., '1' -> 'mouse1')."""
+    s = str(mid)
+    if s.isdigit():
+        return f"mouse{s}"
+    return s
+
 def run_inference():
     if 'mabe_mouse_behavior_detection_path' in globals():
         DATA_PATH = globals()['mabe_mouse_behavior_detection_path']
@@ -749,8 +756,8 @@ def run_inference():
                 submission_rows.append([
                         0,
                         vid,
-                        str(agent_id),
-                        str(target_id),
+                        normalize_id(agent_id),
+                        normalize_id(target_id),
                         action_name,
                         real_start,
                         real_stop
