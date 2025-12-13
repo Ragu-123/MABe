@@ -73,6 +73,19 @@ class BioPhysicsDataset(Dataset):
         for _, row in self.metadata.iterrows():
             vid = str(row['video_id'])
             lab = row['lab_id']
+
+            # Extract pix_cm from metadata if available, else fallback to config
+            pix_cm = None
+            if 'pix per cm (approx)' in row and pd.notna(row['pix per cm (approx)']):
+                 pix_cm = float(row['pix per cm (approx)'])
+            elif 'pix_cm' in row and pd.notna(row['pix_cm']):
+                 pix_cm = float(row['pix_cm'])
+
+            # If not in metadata, use config fallback
+            if pix_cm is None:
+                 conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
+                 pix_cm = conf['pix_cm']
+
             fpath = self.tracking_dir / lab / f"{vid}.parquet"
             mice = []
             if fpath.exists():
@@ -92,7 +105,8 @@ class BioPhysicsDataset(Dataset):
                             'video_id': vid,
                             'lab_id': lab,
                             'agent_id': str(agent), # FORCE STRING
-                            'target_id': str(target) # FORCE STRING
+                            'target_id': str(target), # FORCE STRING
+                            'pix_cm': pix_cm
                         })
 
         # --- Filter Bad Samples ---
@@ -200,7 +214,8 @@ class BioPhysicsDataset(Dataset):
         vid = sample['video_id']
         agent_id = sample['agent_id']
         target_id = sample['target_id']
-        conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
+        pix_cm = sample['pix_cm']
+        # conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT']) # Not needed for pix_cm anymore
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
@@ -268,7 +283,7 @@ class BioPhysicsDataset(Dataset):
             raw_m2 = self._fix_teleport(raw_m2)
 
             # Feature Extraction
-            feats = self._geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+            feats = self._geo_feats(raw_m1, raw_m2, pix_cm)
 
             # CRITICAL FIX: Use sorted keys to match load_lab_vocabulary
             # And fallback to DEFAULT if lab not found
