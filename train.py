@@ -46,8 +46,9 @@ def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta
         predicted_mouse_pairs: defaultdict[str, set[int]] = defaultdict(set)
 
         for row in lab_submission.filter(pl.col('video_id') == video).to_dicts():
-            if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
-                continue
+            # REMOVED FILTER: We now evaluate all predictions regardless of metadata
+            # if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
+            #     continue
 
             new_frames = set(range(row['start_frame'], row['stop_frame']))
             if row['prediction_key'] in prediction_frames:
@@ -1242,14 +1243,63 @@ class DualStreamMaskedFocalLoss(nn.Module):
 # ==============================================================================
 # THRESHOLD TUNER
 # ==============================================================================
-def find_optimal_thresholds(model, val_loader, device, vocab_mask):
-    print("Optimization: Tuning Per-Class Thresholds on Validation Set...")
-    model.eval()
+def optimize_thresholds(all_probs, all_targets):
+    """
+    Optimizes thresholds per class to maximize F1 score.
+    all_probs: List of numpy arrays [T, 37]
+    all_targets: List of numpy arrays [T, 37]
+    """
+    print("Concatenating validation results for tuning...")
+    try:
+        y_pred = np.concatenate(all_probs, axis=0)
+        y_true = np.concatenate(all_targets, axis=0)
+    except ValueError:
+        print("Warning: No validation data found. Returning default thresholds.")
+        return [0.4] * 37
 
-    # We must modify this to work with the new validation structure (no val_loader)
-    # OR, we just skip it for now or implement a mini-loader.
-    # Given the complexity, let's just return defaults for now.
-    return torch.ones(37) * 0.4
+    num_classes = y_pred.shape[1]
+    best_thresholds = [0.4] * num_classes
+    threshold_range = np.arange(0.1, 0.95, 0.05)
+
+    print("Tuning thresholds per class...")
+    for c in range(num_classes):
+        # Optimization: Check if ground truth has any positives
+        # If no positives in GT, F1 is always 0. We should pick a conservative threshold
+        # or leave default.
+        if np.sum(y_true[:, c]) == 0:
+            best_thresholds[c] = 0.4 # Default
+            continue
+
+        best_f1 = -1.0
+        best_th = 0.4
+
+        # Optimization: Calculate F1 for all thresholds
+        scores = y_pred[:, c]
+        targets = y_true[:, c]
+
+        for th in threshold_range:
+            # Binary predictions
+            preds = (scores > th)
+
+            # Counts
+            tp = np.sum(preds & (targets == 1))
+            fp = np.sum(preds & (targets == 0))
+            fn = np.sum((~preds) & (targets == 1))
+
+            denom = 2*tp + fp + fn
+            if denom == 0:
+                f1 = 0.0
+            else:
+                f1 = 2*tp / denom
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+
+        best_thresholds[c] = float(best_th)
+        # print(f"Class {c}: Best Thresh={best_th:.2f}, F1={best_f1:.4f}")
+
+    return best_thresholds
 
 # ==============================================================================
 # TRAINING CONTROLLER
@@ -1388,6 +1438,11 @@ def train_ethoswarm_v3():
         submission_rows = []
         solution_rows = []
 
+        # Lists for Threshold Optimization
+        all_val_probs = []
+        all_val_targets = []
+        all_val_meta = [] # Store (vid, agent, target) for reconstruction
+
         # INFERENCE-STYLE VALIDATION LOOP (Optimized)
         print("Running Optimized Inference-Style Validation...")
 
@@ -1399,7 +1454,7 @@ def train_ethoswarm_v3():
 
         WINDOW_SIZE = 256
         STRIDE = 128
-        thresholds = torch.ones(37).to(DEVICE) * 0.4
+        # thresholds will be tuned later
 
         tracking_root = Path(DATA_PATH) / "train_tracking"
         annot_root = Path(DATA_PATH) / "train_annotation"
@@ -1458,6 +1513,7 @@ def train_ethoswarm_v3():
                         if str(aid_val) == agent_id and str(tid_val) == target_id:
                             pair_adf.append(a_row)
 
+                # Store Solution Rows for later Metric calculation
                 for a_row in pair_adf:
                     solution_rows.append({
                         'video_id': vid,
@@ -1554,27 +1610,59 @@ def train_ethoswarm_v3():
                         count_accum[start:end] += 1.0
 
                 final_probs = prob_accum / (count_accum + 1e-6)
-                preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
 
-                # Segments
-                for c in range(NUM_CLASSES):
-                    action_name = ACTION_LIST[c]
-                    binary_seq = preds[:, c]
-                    diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
-                    starts_seg = np.where(diffs == 1)[0]
-                    stops_seg = np.where(diffs == -1)[0]
+                # STORE PROBS FOR OPTIMIZATION
+                all_val_probs.append(final_probs.cpu().numpy())
+                all_val_meta.append((vid, agent_id, target_id))
 
-                    for s, e in zip(starts_seg, stops_seg):
-                        submission_rows.append({
-                             'video_id': vid,
-                             'agent_id': agent_id,
-                             'target_id': target_id,
-                             'action': action_name,
-                             'start_frame': s,
-                             'stop_frame': e-1
-                        })
+                # BUILD TARGET MASK
+                target_mask = np.zeros((T_total, NUM_CLASSES), dtype=np.float32)
+                for a_row in pair_adf:
+                     s, e = a_row['start_frame'], a_row['stop_frame']
+                     if s < T_total:
+                         e = min(e, T_total)
+                         # Assuming non-overlapping actions per class or overwriting is fine
+                         c_idx = ACTION_TO_IDX[a_row['action']]
+                         target_mask[s:e, c_idx] = 1.0
+                all_val_targets.append(target_mask)
 
                 batches += 1
+
+        # --- OPTIMIZE THRESHOLDS ---
+        best_thresholds = optimize_thresholds(all_val_probs, all_val_targets)
+
+        # Save Thresholds
+        thresh_path = f"ethoswarm_thresholds_ep{epoch+1}.json"
+        with open(thresh_path, 'w') as f:
+            json.dump(best_thresholds, f)
+        print(f"Saved optimized thresholds to {thresh_path}")
+
+        # --- GENERATE SUBMISSION WITH OPTIMIZED THRESHOLDS ---
+        print("Generating submission rows with optimized thresholds...")
+        final_thresholds = np.array(best_thresholds)
+
+        for i, (final_probs_np) in enumerate(all_val_probs):
+             vid, agent_id, target_id = all_val_meta[i]
+
+             preds = (final_probs_np > final_thresholds).astype(int)
+
+             # Segments
+             for c in range(NUM_CLASSES):
+                action_name = ACTION_LIST[c]
+                binary_seq = preds[:, c]
+                diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
+                starts_seg = np.where(diffs == 1)[0]
+                stops_seg = np.where(diffs == -1)[0]
+
+                for s, e in zip(starts_seg, stops_seg):
+                    submission_rows.append({
+                            'video_id': vid,
+                            'agent_id': agent_id,
+                            'target_id': target_id,
+                            'action': action_name,
+                            'start_frame': s,
+                            'stop_frame': e-1
+                    })
 
         # CALCULATE METRIC
         try:
