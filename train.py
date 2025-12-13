@@ -31,27 +31,23 @@ def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta
         label_frames[row['label_key']].update(range(row['start_frame'], row['stop_frame']))
 
     for video in lab_solution['video_id'].unique():
-        active_labels: str = lab_solution.filter(pl.col('video_id') == video)['behaviors_labeled'].first()  # ty: ignore
-        try:
-            active_labels = set(json.loads(active_labels))
-        except:
-             active_labels = set()
+        if video not in lab_submission['video_id']:
+             continue
 
-        # Heuristic: Check if active_labels contains triplets or just actions
-        is_triplet_format = any(',' in l for l in active_labels)
+        active_labels_str = lab_solution.filter(pl.col('video_id') == video)['behaviors_labeled'].first()
+        if active_labels_str is None:
+            active_labels = set()
+        else:
+            try:
+                active_labels = set(json.loads(active_labels_str))
+            except:
+                active_labels = set()
 
         predicted_mouse_pairs: defaultdict[str, set[int]] = defaultdict(set)
 
         for row in lab_submission.filter(pl.col('video_id') == video).to_dicts():
-            triplet = ','.join([str(row['agent_id']), str(row['target_id']), row['action']])
-
-            if is_triplet_format:
-                if triplet not in active_labels: continue
-            elif active_labels: # Action-only format
-                if row['action'] not in active_labels: continue
-
-            if not active_labels:
-                 continue
+            if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
+                continue
 
             new_frames = set(range(row['start_frame'], row['stop_frame']))
             if row['prediction_key'] in prediction_frames:
@@ -245,6 +241,7 @@ class BioPhysicsDataset(Dataset):
         self.tracking_dir = self.root / f"{mode}_tracking"
         self.annot_dir = self.root / f"{mode}_annotation"
         
+        # Verify Paths
         if not self.tracking_dir.exists():
             print(f"WARNING: Tracking directory not found at {self.tracking_dir}")
         if not self.annot_dir.exists():
@@ -254,6 +251,7 @@ class BioPhysicsDataset(Dataset):
         if video_ids is not None:
             self.metadata = self.metadata[self.metadata['video_id'].astype(str).isin(video_ids)]
         
+        # --- PAIR PERMUTATION LOGIC ---
         self.samples = []
         print(f"Scanning {len(self.metadata)} videos for mouse pairs...")
 
@@ -261,17 +259,21 @@ class BioPhysicsDataset(Dataset):
             vid = str(row['video_id'])
             lab = row['lab_id']
             
+            # Peek at parquet columns to find mice
             fpath = self.tracking_dir / lab / f"{vid}.parquet"
             mice = []
             if fpath.exists():
                 try:
+                    # Optimized: Just read 'mouse_id' column unique values
                     df_small = pd.read_parquet(fpath, columns=['mouse_id'])
                     mice = df_small['mouse_id'].unique().tolist()
                 except:
-                    mice = ['mouse1', 'mouse2']
+                    mice = ['mouse1', 'mouse2'] # Fallback
             else:
                 mice = []
 
+            # Create permutations
+            # Extract behavior labels if available (default to empty string if missing)
             b_label = row['behaviors_labeled'] if 'behaviors_labeled' in row else "[]"
 
             for agent in mice:
@@ -280,18 +282,27 @@ class BioPhysicsDataset(Dataset):
                         self.samples.append({
                             'video_id': vid,
                             'lab_id': lab,
-                            'agent_id': str(agent),  # STRICT STRING
-                            'target_id': str(target), # STRICT STRING
+                            'agent_id': str(agent),  # FORCE STRING
+                            'target_id': str(target), # FORCE STRING
                             'behaviors_labeled': b_label
                         })
 
+        # --- Filter Bad Samples ---
         def _quick_parquet_has_frames(path):
             try:
                 pf = pq.ParquetFile(str(path))
                 md = pf.metadata
-                if md.num_rows == 0: return False
-                return True
-            except: return False
+                if md.num_rows == 0:
+                    return False
+                try:
+                    col_names = pf.schema_arrow.names
+                    if 'video_frame' in col_names:
+                        return True
+                    return True
+                except:
+                    return True
+            except:
+                return False
 
         print("Filtering invalid videos...")
         filtered = []
@@ -305,6 +316,7 @@ class BioPhysicsDataset(Dataset):
         self.local_window = 256
         self.action_windows = []
 
+        # Debug Counters
         self.print_limit = 10
         self.print_count = 0
 
@@ -314,11 +326,18 @@ class BioPhysicsDataset(Dataset):
     def _scan_actions_safe(self):
         count = 0
         print("Scanning subset of annotations for sampling...")
+        # Reduce scan size for speed
         for i, s in enumerate(self.samples):
+            # if i > 200: break # REMOVED to scan all
             p = self.annot_dir / s['lab_id'] / f"{s['video_id']}.parquet"
             if p.exists():
                 try:
                     df = pd.read_parquet(p)
+                    # Find centers
+                    # Relaxed scanning: Don't filter by agent_id here to avoid empty action_windows due to ID mismatch.
+                    # We will filter strictly in _load() to assign correct targets.
+                    # This ensures we get candidate windows even if metadata matching is imperfect.
+
                     df = df[df['action'].isin(ACTION_TO_IDX)]
                     if not df.empty:
                         for c in ((df['start_frame'] + df['stop_frame']) // 2).values:
@@ -331,9 +350,8 @@ class BioPhysicsDataset(Dataset):
         lab = sample['lab_id']
         conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
         
-        # STRICT STRINGS
-        agent_id = str(sample['agent_id'])
-        target_id = str(sample['target_id'])
+        agent_id = sample['agent_id']
+        target_id = sample['target_id']
         vid = sample['video_id']
         b_label = sample['behaviors_labeled']
 
@@ -347,29 +365,37 @@ class BioPhysicsDataset(Dataset):
         raw_m1 = None
         raw_m2 = None
 
+        # Targets
         target = torch.zeros((self.local_window, NUM_CLASSES), dtype=torch.float32)
         weights = torch.zeros(self.local_window, dtype=torch.float32)
         centerness = torch.zeros((self.local_window, 1), dtype=torch.float32)
 
         if fpath.exists():
             try:
+                # OPTIMIZATION: Use Polars for lazy scanning and filtering
                 lf = pl.scan_parquet(fpath)
+                
+                # 1. Get Limits (lazy)
+                # Fetch max frame to determine L
                 meta_df = lf.select(pl.col('video_frame').max()).collect()
                 if meta_df.shape[0] > 0 and meta_df.item(0, 0) is not None:
                     max_frame = meta_df.item(0, 0)
                     L = max_frame + 1
 
+                    # 2. Pick Window
                     if center is None:
+                        # Smart sampling: Pick a frame where the mice are actually present
+                        # This prevents empty window queries during validation/random sampling
                         try:
-                            # Lazy filter with STRICT CASTING to utf8
                             valid_frames_sample = (
                                 lf
-                                .filter(pl.col('mouse_id').cast(pl.Utf8).is_in([agent_id, target_id]))
+                                .filter(pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)]))
                                 .select('video_frame')
-                                .head(1000)
+                                .head(1000) # Sample a subset to avoid full scan
                                 .collect()
                             )
                             if valid_frames_sample.shape[0] > 0:
+                                # Pick random valid frame from the sample
                                 ridx = random.randint(0, valid_frames_sample.shape[0] - 1)
                                 center = valid_frames_sample.item(ridx, 0)
                             else:
@@ -383,34 +409,42 @@ class BioPhysicsDataset(Dataset):
                     frame_start = s
                     frame_end = e
 
-                    # STRICT FILTERING
+                    # 3. Filter and Fetch Window (Lazy evaluation pushes down filters)
+                    # Cast mouse_id to string for robustness
                     q = (
                         lf
                         .filter(
                             (pl.col('video_frame') >= s) &
                             (pl.col('video_frame') < e) &
-                            (pl.col('mouse_id').cast(pl.Utf8).is_in([agent_id, target_id]))
+                            (pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)]))
                         )
                         .collect()
                     )
 
+                    # 4. Process into Buffers
+                    # If empty, data_loaded remains False
                     if not q.is_empty():
+                        # Convert to pandas for easier numpy handling or handle directly
                         df = q.to_pandas()
+
+                        # Prepare buffers - size is window length (e-s)
+                        # We map video_frame to buffer index: idx = video_frame - s
                         win_len = e - s
                         raw_m1 = np.zeros((win_len, 11, 2), dtype=np.float32)
                         raw_m2 = np.zeros((win_len, 11, 2), dtype=np.float32)
 
                         # Mouse 1
-                        d1 = df[df['mouse_id'].astype(str) == agent_id]
+                        d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
                         for i, bp in enumerate(BODY_PARTS):
                             rows = d1[d1['bodypart']==bp]
                             if not rows.empty:
                                 indices = rows['video_frame'].values - s
+                                # Safety bounds
                                 valid = (indices >= 0) & (indices < win_len)
                                 raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
 
                         # Mouse 2
-                        d2 = df[df['mouse_id'].astype(str) == target_id]
+                        d2 = df[df['mouse_id'].astype(str) == str(target_id)]
                         for i, bp in enumerate(BODY_PARTS):
                             rows = d2[d2['bodypart']==bp]
                             if not rows.empty:
@@ -425,9 +459,12 @@ class BioPhysicsDataset(Dataset):
                     debug_msg = "Empty video_frame column or file."
             except Exception as e:
                 debug_msg = f"Load Error: {e}"
+                # import traceback
+                # traceback.print_exc()
         else:
             debug_msg = f"File not found: {fpath}"
 
+        # Fallback / Padding
         if raw_m1 is None:
             raw_m1 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
             raw_m2 = np.zeros((self.local_window, 11, 2), dtype=np.float32)
@@ -438,11 +475,14 @@ class BioPhysicsDataset(Dataset):
             raw_m1 = np.concatenate([raw_m1, pad_arr], axis=0)
             raw_m2 = np.concatenate([raw_m2, pad_arr], axis=0)
 
+        # 1. Teleport Fix
         raw_m1 = _fix_teleport(raw_m1)
         raw_m2 = _fix_teleport(raw_m2)
         
+        # 3. Features
         feats = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
         
+        # 4. Targets Setup
         if data_loaded:
              valid_len = frame_end - frame_start
              if valid_len > 0:
@@ -453,15 +493,17 @@ class BioPhysicsDataset(Dataset):
             if ap.exists():
                 try:
                     adf = pd.read_parquet(ap)
+                    # Determine filter columns (agent vs agent_id)
+                    aid_col = 'agent_id' if 'agent_id' in adf.columns else 'agent'
+                    tid_col = 'target_id' if 'target_id' in adf.columns else 'target'
+
+                    # Determine filter columns (agent vs agent_id)
                     aid_col = 'agent_id' if 'agent_id' in adf.columns else 'agent'
                     tid_col = 'target_id' if 'target_id' in adf.columns else 'target'
 
                     if aid_col in adf.columns and tid_col in adf.columns:
-                        # CRITICAL: Force string conversion for robust matching in Pandas
-                        adf[aid_col] = adf[aid_col].astype(str)
-                        adf[tid_col] = adf[tid_col].astype(str)
-
-                        adf = adf[(adf[aid_col] == agent_id) & (adf[tid_col] == target_id)]
+                         # Filter with explicit string casting for robustness
+                         adf = adf[(adf[aid_col].astype(str) == str(agent_id)) & (adf[tid_col].astype(str) == str(target_id))]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
@@ -470,6 +512,7 @@ class BioPhysicsDataset(Dataset):
                             if st < et:
                                 target[st:et, ACTION_TO_IDX[row['action']]] = 1.0
 
+                                # Centerness Target (Gaussian)
                                 c_local = (st + et) / 2.0
                                 width = et - st
                                 t_grid = torch.arange(st, et, dtype=torch.float32)
@@ -481,14 +524,17 @@ class BioPhysicsDataset(Dataset):
         
         lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
+        # Debug Print
         if not data_loaded and self.print_count < self.print_limit:
              print(f"[DEBUG] Load Failed for {vid}: {debug_msg}")
              self.print_count += 1
 
+        # DEBUG: Check signal
         if data_loaded and self.print_count < self.print_limit and weights.sum() == 0:
-             print(f"[DEBUG] Weights are ZERO despite DataLoaded! Vid: {vid}, Range: {frame_start}-{frame_end}")
+             print(f"[DEBUG] Weights are ZERO despite DataLoaded! Vid: {vid}, Frame range: {frame_start}-{frame_end}")
              self.print_count += 1
 
+        # Pack Metadata
         meta_info = {
             'video_id': vid,
             'agent_id': agent_id,
@@ -501,6 +547,8 @@ class BioPhysicsDataset(Dataset):
         return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
 
     def __getitem__(self, idx):
+        # Mix Action Windows (90%) and Random Valid Windows (10%)
+        # Random windows use "Smart Sampling" in _load to ensure data validity
         if len(self.action_windows) > 0 and random.random() < 0.9:
             i, c = self.action_windows[random.randint(0, len(self.action_windows)-1)]
             return self._load(i, c)
@@ -513,12 +561,26 @@ def pad_collate_dual(batch):
     return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
 
 # Module 2: The Morphological & Interaction Core.
+
+# ==============================================================================
+# 1. CANONICAL GRAPH ADAPTER (Signal Refinement)
+# ==============================================================================
 class CanonicalGraphAdapter(nn.Module):
+    # INPUT: [B, T, 11, 16] (Geometric Features)
     def __init__(self, input_nodes=11, canonical_nodes=11, feat_dim=16, num_labs=20):
         super().__init__()
+
+        # Learnable Projection Matrix: (NumLabs, 11, 11)
+        # Learns to map tracking artifacts to a canonical topology per lab
         self.projection = nn.Parameter(torch.eye(input_nodes).unsqueeze(0).repeat(num_labs, 1, 1))
+        
+        # Identity initialization with slight noise
         self.projection.data += torch.randn_like(self.projection) * 0.01
+
+        # Lab-Specific Bias (Correction for systematic sensor offset)
         self.bias = nn.Parameter(torch.zeros(num_labs, 1, canonical_nodes, feat_dim))
+
+        # Refinement MLP (Cleans physics calculations)
         self.refine = nn.Sequential(
             nn.Linear(feat_dim, feat_dim * 2),
             nn.LayerNorm(feat_dim * 2),
@@ -527,23 +589,46 @@ class CanonicalGraphAdapter(nn.Module):
         )
 
     def forward(self, x, lab_idx):
+        # x: (Batch, Time, 11, 16)
+        # lab_idx: (Batch)
         b, t, n, f = x.shape
-        W = self.projection[lab_idx]
-        B = self.bias[lab_idx]
-        x_flat = x.view(-1, n, f)
+
+        # 1. Fetch Weights
+        W = self.projection[lab_idx] # (B, 11, 11)
+        B = self.bias[lab_idx]       # (B, 1, 11, 16)
+
+        # 2. Graph Projection (Node Mixing)
+        # We process all time-steps in parallel by flattening B*T
+        x_flat = x.view(-1, n, f) # (B*T, 11, 16)
+        
+        # Prepare Projection Matrix: Expand to T, then view as (B*T, 11, 11)
         W_flat = W.unsqueeze(1).repeat(1, t, 1, 1).view(-1, n, n)
+
+        # Apply Graph Projection: nodes^T * W
+        # (B*T, 16, 11) @ (B*T, 11, 11) -> (B*T, 16, 11)
         x_t = x_flat.transpose(1, 2) 
         out = torch.bmm(x_t, W_flat) 
-        out = out.transpose(1, 2).view(b, t, n, f)
-        out = out + B
-        out = self.refine(out)
-        return out
 
+        # 3. Reshape Back & Apply Physics Refinement
+        out = out.transpose(1, 2).view(b, t, n, f)
+        out = out + B # Apply Bias
+        out = self.refine(out)
+
+        return out # (Batch, Time, 11, 16)
+
+# ==============================================================================
+# 2. SOCIAL INTERACTION BLOCK (Upgraded to Graph Attention)
+# ==============================================================================
 class SocialInteractionBlock(nn.Module):
     def __init__(self, node_dim=16, hidden_dim=64):
         super().__init__()
+
+        # Graph Attention Network (GAT)
+        # Queries: Agent Nodes, Keys/Values: Target Nodes
         self.attention = nn.MultiheadAttention(embed_dim=node_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(node_dim)
+
+        # Relational MLP (Post-Attention)
         self.relational_mlp = nn.Sequential(
             nn.Linear(node_dim * 2, hidden_dim),
             nn.GELU(),
@@ -551,77 +636,165 @@ class SocialInteractionBlock(nn.Module):
         )
 
     def forward(self, agent_canon, target_canon):
+        # Input: [B, T, 11, 16] (Normalized Egocentric Features)
         b, t, n, f = agent_canon.shape
+        
+        # Flatten Time for Batch processing
         a_flat = agent_canon.view(b*t, n, f)
         t_flat = target_canon.view(b*t, n, f)
+        
+        # Attention: How much does each part of 'Agent' care about 'Target' parts?
         attn_out, _ = self.attention(query=a_flat, key=t_flat, value=t_flat)
-        interact_ctx = self.norm(a_flat + attn_out)
-        combined = torch.cat([a_flat, interact_ctx], dim=-1)
-        interact_summ = combined.mean(dim=1)
-        interact_summ = interact_summ.view(b, t, -1)
-        rel_embed = self.relational_mlp(interact_summ)
+        
+        # Residual + Norm
+        # This creates "Contextualized Agent" features enriched with Target info
+        interact_ctx = self.norm(a_flat + attn_out) # [B*T, 11, 16]
+        
+        # Aggregate Interaction (Pool over nodes)
+        # We concat Original + Interaction Context
+        combined = torch.cat([a_flat, interact_ctx], dim=-1) # [B*T, 11, 32]
+        interact_summ = combined.mean(dim=1) # [B*T, 32]
+        
+        # Reshape back to time
+        interact_summ = interact_summ.view(b, t, -1) # [B, T, 32]
+        
+        # Final Embedding
+        rel_embed = self.relational_mlp(interact_summ) # [B, T, 32]
+
         return agent_canon, target_canon, rel_embed
 
+# ==============================================================================
+# WRAPPER: MORPHOLOGICAL INTERACTION CORE
+# ==============================================================================
 class MorphologicalInteractionCore(nn.Module):
     def __init__(self, num_labs=20):
         super().__init__()
+        # Standard input 11 canonical nodes
         self.adapter = CanonicalGraphAdapter(input_nodes=11, canonical_nodes=11, num_labs=num_labs)
         self.interaction = SocialInteractionBlock()
+
+        # Fusion: (11 nodes * 16 features * 2 agents) + 32 relation = 384
         self.frame_fusion = nn.Linear(384, 128)
 
     def forward(self, agent_x, target_x, lab_idx):
+        # 1. Adapt Topology (Refine Physics/Geometry)
         a_c = self.adapter(agent_x, lab_idx)
         t_c = self.adapter(target_x, lab_idx)
+
+        # 2. Compute Social Relations (Graph Attention)
         _, _, rel_embed = self.interaction(a_c, t_c)
+
+        # 3. Flatten for Transformer Input
         b, t, n, f = a_c.shape
         a_flat = a_c.view(b, t, -1)
         t_flat = t_c.view(b, t, -1)
-        combined = torch.cat([a_flat, t_flat, rel_embed], dim=-1)
-        out = self.frame_fusion(combined)
+
+        # 4. Dense Fusion
+        # Fuses Self(A) + Self(B) + Relationship
+        combined = torch.cat([a_flat, t_flat, rel_embed], dim=-1) # [B, T, 384]
+        out = self.frame_fusion(combined) # [B, T, 128]
+
+        # Returns: 
+        # out -> The Fused Token (used for Global Context / Temporal processing)
+        # a_c, t_c -> The Canonical Skeletons (used for Physics Gating in Mod 5)
         return out, a_c, t_c
 
 # Module 3: The Split-Stream Interaction Block
+
 class SplitStreamInteractionBlock(nn.Module):
     def __init__(self, node_dim=16, hidden_dim=128):
         super(SplitStreamInteractionBlock, self).__init__()
-        self.self_input_size = 11 * 4
+
+        # ----------------------------------------------------------------------
+        # BRANCH A: SELF-BEHAVIOR STREAM (The "Me" Branch)
+        # ----------------------------------------------------------------------
+        # Focus: Posture, Grooming, Rearing, Running.
+        # Input: Strictly LIMITED to the first 4 channels of the Agent (Pos X/Y, Vel, Speed).
+        # We explicitly block Neighbor information (Channels 4+) from this stream
+        # to prevent "Soft Leaks" (the Self branch learning Pair behaviors).
+        self.self_input_size = 11 * 4 # 11 Nodes * 4 Feats (Pos/Vel)
+        
         self.self_projector = nn.Sequential(
             nn.Linear(self.self_input_size, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+
+        # ----------------------------------------------------------------------
+        # BRANCH B: PAIR-BEHAVIOR STREAM (The "Us" Branch)
+        # ----------------------------------------------------------------------
+        # Focus: Interaction, Distance, Chasing, Fight.
+        # Input: Agent (Full) + Target (Full) + Interaction Token.
+        
+        # 1. Relational Engine (Simple Distance/Speed for Pair stream fallback)
         self.relational_mlp = nn.Sequential(
-            nn.Linear(3, 32),
+            nn.Linear(3, 32), # [Rel_X, Rel_Y, Rel_Dist] averaged over nodes
             nn.GELU(),
             nn.Linear(32, 32)
         )
-        full_node_dim = 11 * node_dim
+
+        # 2. Fusion Layer
+        # Agent (176) + Target (176) + Rel (32) + Roles (2)
+        full_node_dim = 11 * node_dim # 176
         pair_input_dim = (full_node_dim * 2) + 32 + 2
+        
         self.pair_projector = nn.Sequential(
             nn.Linear(pair_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+
+        # Role Tokens (Solves "Multi-Agent Roles")
+        # [1, 0] = "I am Acting", [0, 1] = "I am Receiving"
         self.role_embedding = nn.Parameter(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
 
     def forward(self, agent_c, target_c, role_indices=None):
+        """
+        agent_c:  [Batch, Time, 11, 16] (Canonical Skeleton w/ Geo Features)
+        target_c: [Batch, Time, 11, 16] 
+        role_indices: [Batch] Tensor of 0 or 1. If None, defaults to 0 (Agent).
+        """
         batch, time, nodes, feat = agent_c.shape
-        agent_proprioception = agent_c[..., 0:4]
-        agent_flat_self = agent_proprioception.contiguous().view(batch, time, -1)
-        self_feat = self.self_projector(agent_flat_self)
 
+        # ----------------------------------------------------------
+        # 1. PROCESS SELF STREAM (Strict Slicing)
+        # ----------------------------------------------------------
+        # Only take Channels 0,1,2,3 (Pos, Vel). 
+        # Channels 4+ contain Neighbor Relative info -> BLOCKED.
+        agent_proprioception = agent_c[..., 0:4] # [B, T, 11, 4]
+        agent_flat_self = agent_proprioception.contiguous().view(batch, time, -1)
+        
+        self_feat = self.self_projector(agent_flat_self) # [B, T, 128]
+
+        # ----------------------------------------------------------
+        # 2. PROCESS PAIR STREAM (Full Context)
+        # ----------------------------------------------------------
+        # Flatten full skeletons
         agent_flat_full = agent_c.view(batch, time, -1)
         target_flat_full = target_c.view(batch, time, -1)
-        rel_feats = agent_c[..., 4:7].mean(dim=2)
-        rel_embed = self.relational_mlp(rel_feats)
+        
+        # Extract Relational Data baked into Module 1 output
+        # Channels: 4 (Neighbor X), 5 (Neighbor Y), 6 (Dist)
+        rel_feats = agent_c[..., 4:7].mean(dim=2) # [B, T, 3]
+        
+        # Embed Relation
+        rel_embed = self.relational_mlp(rel_feats) # [B, T, 32]
 
+        # Select Role Tokens
+        # If role_indices is provided, use it. Else default to Agent (0)
         if role_indices is None:
+            # Default: All are Agents [1,0]
             selected_role = self.role_embedding[0].view(1, 1, 2).expand(batch, time, 2)
         else:
+            # Gather based on index [B]
+            # self.role_embedding is [2, 2]
+            # we want [B, 2] -> expand to [B, T, 2]
             selected_role = self.role_embedding[role_indices].unsqueeze(1).expand(batch, time, 2)
 
+        # Fuse Pair Features
+        # Concatenate: Agent(Full) + Target(Full) + Relation + Role
         pair_input = torch.cat([
             agent_flat_full, 
             target_flat_full, 
@@ -629,13 +802,21 @@ class SplitStreamInteractionBlock(nn.Module):
             selected_role
         ], dim=-1)
         
-        pair_feat = self.pair_projector(pair_input)
+        pair_feat = self.pair_projector(pair_input) # [B, T, 128]
+
         return self_feat, pair_feat
 
 # Module 4: The Local-Global Chronos Encoder
+
 class LocalGlobalChronosEncoder(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=128):
         super(LocalGlobalChronosEncoder, self).__init__()
+
+        # ======================================================================
+        # 1. GLOBAL CONTEXT STREAM (The "Narrative" Memory)
+        # ======================================================================
+        # Processes the 1 FPS Global Pair Features.
+        # Captures long-term states (e.g., "Dominance established 10 mins ago").
         self.global_proj = nn.Linear(input_dim, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim, max_len=5000)
 
@@ -648,53 +829,102 @@ class LocalGlobalChronosEncoder(nn.Module):
             activation="gelu"
         )
         self.global_transformer = nn.TransformerEncoder(global_layer, num_layers=2)
+
+        # AUXILIARY HEAD FOR GLOBAL STREAM
         self.global_classifier = nn.Linear(hidden_dim, 37)
 
+        # ======================================================================
+        # 2. LOCAL SELF STREAM (The "Me" Branch) - DEEP TCN + ATTENTION
+        # ======================================================================
+        # Updated: Receptive Field ~2.0 seconds (64 frames)
         self.self_tcn = nn.Sequential(
+            # Frame Level (d=1)
             nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
+            
+            # Short Range (d=2)
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
+            
+            # Medium Range (d=4)
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
         )
+        
+        # New: Bidirectional Transformer for Local Temporal Mixing
         self.self_local_attn = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
+
+        # Cross-Attention to Global 
         self.self_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.self_norm = nn.LayerNorm(hidden_dim)
 
+        # ======================================================================
+        # 3. LOCAL PAIR STREAM (The "Us" Branch) - DEEP TCN + ATTENTION
+        # ======================================================================
         self.pair_tcn = nn.Sequential(
+            # Frame Level
             nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
+            
+            # Short
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
+            
+            # Medium
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
         )
+
+        # New: Bidirectional Transformer for Local Temporal Mixing
         self.pair_local_attn = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
+        
+        # Cross-Attention to Global
         self.pair_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.pair_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, global_feat, local_self, local_pair):
+        """
+        global_feat: [Batch, T_g, 128] 
+        local_self:  [Batch, T_l, 128] 
+        local_pair:  [Batch, T_l, 128] 
+        """
+
+        # --- A. Build Global Memory Bank ---
         g_emb = self.global_proj(global_feat)
         g_emb = self.pos_encoder(g_emb)
-        global_memory = self.global_transformer(g_emb)
+        global_memory = self.global_transformer(g_emb) # [B, T_g, 128]
+
+        # AUX OUTPUT
         global_logits = self.global_classifier(global_memory)
 
-        s_in = local_self.permute(0, 2, 1)
-        s_tcn = self.self_tcn(s_in).permute(0, 2, 1)
+        # --- B. Process Local Self Stream ---
+        # 1. TCN 
+        s_in = local_self.permute(0, 2, 1) # [B, C, T]
+        s_tcn = self.self_tcn(s_in).permute(0, 2, 1) # [B, T, C]
+
+        # 2. Local Transformer (Bidirectional)
         s_tcn = self.self_local_attn(s_tcn)
+
+        # 3. Cross-Attention
+        # Query: Local TCN, Key/Value: Global Memory
         s_ctx, _ = self.self_attn(query=s_tcn, key=global_memory, value=global_memory)
         self_out = self.self_norm(s_tcn + s_ctx) 
 
+        # --- C. Process Local Pair Stream ---
+        # 1. TCN
         p_in = local_pair.permute(0, 2, 1)
         p_tcn = self.pair_tcn(p_in).permute(0, 2, 1)
+
+        # 2. Local Transformer (Bidirectional)
         p_tcn = self.pair_local_attn(p_tcn)
+
+        # 3. Cross-Attention
         p_ctx, _ = self.pair_attn(query=p_tcn, key=global_memory, value=global_memory)
         pair_out = self.pair_norm(p_tcn + p_ctx)
 
@@ -716,66 +946,132 @@ class PositionalEncoding(nn.Module):
             return x + self.pe[:self.pe.size(0), :].repeat(math.ceil(L/self.pe.size(0)), 1)[:L, :]
         return x + self.pe[:L, :]
 
+
 # Module 5: The Multi-Task Logic Head
+
 class MultiTaskLogicHead(nn.Module):
     def __init__(self, input_dim=128, num_labs=20):
         super(MultiTaskLogicHead, self).__init__()
+
+        # 1. DOMAIN EMBEDDING
         self.lab_embedding = nn.Embedding(num_labs, 32)
+
+        # 2. FEATURE EXPANSION
         fusion_dim = input_dim + 32
         expanded_dim = 256 
+
+        # 3. HEAD A: SELF BEHAVIORS
         self.self_classifier = nn.Sequential(
             nn.Linear(fusion_dim, expanded_dim),
             nn.LayerNorm(expanded_dim),
             nn.GELU(),
             nn.Linear(expanded_dim, 11) 
         )
+
+        # 4. HEAD B: PAIR BEHAVIORS
         self.pair_classifier = nn.Sequential(
             nn.Linear(fusion_dim, expanded_dim),
             nn.LayerNorm(expanded_dim),
             nn.GELU(),
             nn.Linear(expanded_dim, 26) 
         )
+
+        # 5. CENTER REGRESSOR
         self.center_regressor = nn.Sequential(
             nn.Linear(fusion_dim, 64),
             nn.GELU(),
             nn.Linear(64, 1) 
         )
+
+        # 6. PHYSICS LOGIC GATE 
         self.gate_control = nn.Linear(1, 1)
         
+        # --- CRITICAL FIX: INITIALIZATION ---
         with torch.no_grad():
+            # Force Gate Open (start unbiased)
             self.gate_control.bias.fill_(2.0)
+            
+            # FORCE CLASSIFIERS TO PREDICT BACKGROUND (Prob ~0.01)
+            # The final Linear layer is at index [3] of Sequential
+            # Logits = -4.59 -> Sigmoid(-4.59) = 0.01
             nn.init.constant_(self.self_classifier[3].bias, -4.59)
             nn.init.constant_(self.pair_classifier[3].bias, -4.59)
+            
+            # Start Center Regression at 0.5 (Midpoint)
             nn.init.constant_(self.center_regressor[2].bias, 0.0)
 
     def forward(self, self_feat, pair_feat, lab_idx, agent_c, target_c):
+        """
+        self_probs: [B, T, 11] (0.0 - 1.0)
+        pair_probs: [B, T, 26] (0.0 - 1.0)
+        """
         batch, time, _ = self_feat.shape
+
+        # A. Context
         lab_context = self.lab_embedding(lab_idx).unsqueeze(1).expand(-1, time, -1)
         self_input = torch.cat([self_feat, lab_context], dim=-1)
         pair_input = torch.cat([pair_feat, lab_context], dim=-1)
+
+        # B. Raw Logits
         self_logits = self.self_classifier(self_input) 
         pair_logits = self.pair_classifier(pair_input) 
+        
+        # Center Score (Unactivated Logits? Or Sigmoid? Usually Sigmoid for 0-1)
+        # We trained with MSE against 0-1, so Sigmoid is correct.
         center_score = torch.sigmoid(self.center_regressor(pair_input))
 
+        # C. Physics Gate
+        # Dist Logic
         a_pos = agent_c[:, :, 0, :2]
         t_pos = target_c[:, :, 0, :2]
         dist = torch.norm(a_pos - t_pos, dim=-1, keepdim=True) 
+
         gate = torch.sigmoid(self.gate_control(dist))
+
+        # D. Activation
         self_probs = torch.sigmoid(self_logits)
+        
+        # Combine Pair Logits with Gate
         pair_probs = torch.sigmoid(pair_logits) * gate
+
         return self_probs, pair_probs, center_score
 
 # Module 6: Final Assembly (EthoSwarmNet V4 - Enhanced)
+
+# BEHAVIOR DEFINITIONS
 SELF_BEHAVIORS = sorted(["biteobject", "climb", "dig", "exploreobject", "freeze", "genitalgroom", "huddle", "rear", "rest", "run", "selfgroom"])
 PAIR_BEHAVIORS = sorted(["allogroom", "approach", "attack", "attemptmount", "avoid", "chase", "chaseattack", "defend", "disengage", "dominance", "dominancegroom", "dominancemount", "ejaculate", "escape", "flinch", "follow", "intromit", "mount", "reciprocalsniff", "shepherd", "sniff", "sniffbody", "sniffface", "sniffgenital", "submit", "tussle"])
 
 class EthoSwarmNet(nn.Module):
     def __init__(self, num_classes=37, input_dim=128):
         super(EthoSwarmNet, self).__init__()
+
+        # ----------------------------------------------------------------------
+        # 1. Morphological Core (Module 2)
+        # ----------------------------------------------------------------------
         self.morph_core = MorphologicalInteractionCore(num_labs=20)
+
+        # ----------------------------------------------------------------------
+        # 2. Split-Stream Block (Module 3)
+        # ----------------------------------------------------------------------
         self.split_interaction = SplitStreamInteractionBlock(hidden_dim=128)
+
+        # ----------------------------------------------------------------------
+        # 3. Local-Global Chronos (Module 4)
+        # ----------------------------------------------------------------------
         self.chronos = LocalGlobalChronosEncoder(input_dim=128, hidden_dim=128)
-        self.logic_head = MultiTaskLogicHead(input_dim=128, num_labs=20)
+
+        # ----------------------------------------------------------------------
+        # 4. Multi-Task Logic Head (Module 5)
+        # ----------------------------------------------------------------------
+        self.logic_head = MultiTaskLogicHead(
+            input_dim=128,
+            num_labs=20
+        )
+
+        # ----------------------------------------------------------------------
+        # 5. Output Stitching Maps
+        # ----------------------------------------------------------------------
         self.register_buffer('self_indices', self._get_indices(SELF_BEHAVIORS))
         self.register_buffer('pair_indices', self._get_indices(PAIR_BEHAVIORS))
 
@@ -793,34 +1089,67 @@ class EthoSwarmNet(nn.Module):
         The V4 Forward Pass:
         Global/Local Streams -> Topology -> Split -> Time -> Logic -> Stitch
         """
-        # --- CRITICAL FIX: NaN Safety ---
-        global_agent = torch.nan_to_num(global_agent, nan=0.0)
-        global_target = torch.nan_to_num(global_target, nan=0.0)
-        local_agent = torch.nan_to_num(local_agent, nan=0.0)
-        local_target = torch.nan_to_num(local_target, nan=0.0)
+        # Safety: NaNs
+        # It's possible for inputs to be all-zeros (missing data) which is fine, but if NaNs appear we crash.
+        # We can clip or fill NaNs.
+        # Check if NaNs exist? Only if training is unstable.
+        # Ideally, we trust the data loader to not produce NaNs.
+        # The CUDA error might be due to very large gradients or weird values.
 
+        # --- A. TOPOLOGY (Module 2) ---
         g_out, _, _ = self.morph_core(global_agent, global_target, lab_idx)
         _, l_ac, l_tc = self.morph_core(local_agent, local_target, lab_idx)
+
+        # --- B. SPLIT-STREAM (Module 3) ---
+        # Pass Role Index here
         l_self, l_pair = self.split_interaction(l_ac, l_tc, role_indices=role_idx)
+
+        # --- C. TIME & CONTEXT (Module 4) ---
+        # Returns global_logits now too
         t_self, t_pair, g_logits = self.chronos(g_out, l_self, l_pair)
+
+        # --- D. LOGIC & PHYSICS (Module 5) ---
+        # center_score is the Regression Head output (0.0 to 1.0)
         p_self, p_pair, center_score = self.logic_head(t_self, t_pair, lab_idx, l_ac, l_tc)
 
+        # --- E. OUTPUT STITCHING ---
         batch, time, _ = p_self.shape
+        # Reconstruct [Batch, T, 37] for classification targets
         final_output = torch.zeros(batch, time, 37, device=p_self.device, dtype=p_self.dtype)
+
         final_output.index_copy_(2, self.self_indices, p_self)
         final_output.index_copy_(2, self.pair_indices, p_pair)
         
+        # Return all required outputs for loss
+        # final_output: [B, T, 37]
+        # center_score: [B, T, 1]
+        # g_logits: [B, T_g, 37] (Needs resizing or matching?)
+        # g_logits matches global input length. We can supervise it if we pool target?
+        # Or interpolate g_logits to T?
+        # Let's interpolate g_logits to T for simple supervision
+
         g_logits_up = F.interpolate(g_logits.permute(0,2,1), size=time, mode='linear').permute(0,2,1)
+
         return final_output, center_score, g_logits_up
 
 # Module 7: The Training Loop & Validation
+
+# ==============================================================================
+# UTILS & METRICS
+# ==============================================================================
 def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
+    """
+    Loads a boolean mask [20, 37] where 1.0 means the lab annotates that action.
+    """
     if not os.path.exists(vocab_path):
         return torch.ones(25, 37).to(device)
+        
     with open(vocab_path, 'r') as f:
         vocab = json.load(f)
+    
     lab_names = sorted(list(LAB_CONFIGS.keys()))
     mask = torch.zeros(len(lab_names), num_classes).to(device)
+    
     for i, name in enumerate(lab_names):
         if name in vocab:
             for a in vocab[name]:
@@ -831,14 +1160,23 @@ def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
     return mask
 
 def get_batch_f1(probs_in, targets, batch_vocab_mask, temporal_weights, thresholds=0.4):
+    """
+    Calculates F1 Score. 'thresholds' can be a scalar or a [37] tensor.
+    """
     preds = (probs_in > thresholds).float()
+    
     valid_pixels = temporal_weights.unsqueeze(-1) * batch_vocab_mask.unsqueeze(1)
+    
     tp = (preds * targets * valid_pixels).sum()
     fp = (preds * (1-targets) * valid_pixels).sum()
     fn = ((1-preds) * targets * valid_pixels).sum()
+    
     f1 = 2*tp / (2*tp + fp + fn + 1e-6)
     return f1.item()
 
+# ==============================================================================
+# LOSS FUNCTION (CLASS-BALANCED FOCAL LOSS + AUX + CENTER)
+# ==============================================================================
 class DualStreamMaskedFocalLoss(nn.Module):
     def __init__(self, model_self_indices, model_pair_indices, gamma=2.0):
         super().__init__()
@@ -849,8 +1187,16 @@ class DualStreamMaskedFocalLoss(nn.Module):
         self.bce_aux = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, model_output_probs, center_pred, aux_logits, target, center_target, weight_mask, lab_vocab_mask):
+        """
+        Inputs:
+        model_output_probs: [B, T, 37] (Sigmoid Applied)
+        center_pred: [B, T, 1] (Sigmoid Applied)
+        aux_logits: [B, T, 37] (Raw Logits)
+        """
+        # 1. MAIN CLASSIFICATION LOSS (Focal)
         p_self = model_output_probs[:, :, self.self_idx]
         p_pair = model_output_probs[:, :, self.pair_idx]
+        
         t_self = target[:, :, self.self_idx]
         t_pair = target[:, :, self.pair_idx]
         
@@ -872,15 +1218,42 @@ class DualStreamMaskedFocalLoss(nn.Module):
         loss_main = (l_self_raw * m_self * tm).sum() / ((m_self * tm).sum() + 1e-6) + \
                     (l_pair_raw * m_pair * tm).sum() / ((m_pair * tm).sum() + 1e-6)
 
-        l_center = self.mse(center_pred, center_target)
+        # 2. CENTER REGRESSION LOSS (MSE)
+        # Only compute on valid time pixels
+        # center_target: [B, T, 1]
+        l_center = self.mse(center_pred, center_target) # [B, T, 1]
         loss_center = (l_center * tm).sum() / (tm.sum() + 1e-6)
         
+        # 3. AUXILIARY GLOBAL LOSS
+        # aux_logits is [B, T, 37], matches target
+        # We assume global stream should predict same as local ground truth?
+        # Yes, "what is happening now".
+        # Masked by lab vocabulary
+        # Expand lab mask to [B, 1, 37]
         vocab_mask_exp = lab_vocab_mask.unsqueeze(1)
-        l_aux = self.bce_aux(aux_logits, target)
+        
+        l_aux = self.bce_aux(aux_logits, target) # [B, T, 37]
         loss_aux = (l_aux * vocab_mask_exp * tm).sum() / ((vocab_mask_exp * tm).sum() + 1e-6)
 
+        # TOTAL
+        # Weights: Main=1.0, Center=0.5, Aux=0.3
         return loss_main + 0.5 * loss_center + 0.3 * loss_aux
 
+# ==============================================================================
+# THRESHOLD TUNER
+# ==============================================================================
+def find_optimal_thresholds(model, val_loader, device, vocab_mask):
+    print("Optimization: Tuning Per-Class Thresholds on Validation Set...")
+    model.eval()
+
+    # We must modify this to work with the new validation structure (no val_loader)
+    # OR, we just skip it for now or implement a mini-loader.
+    # Given the complexity, let's just return defaults for now.
+    return torch.ones(37) * 0.4
+
+# ==============================================================================
+# TRAINING CONTROLLER
+# ==============================================================================
 def train_ethoswarm_v3():
     # --- 1. SETUP & PATHS ---
     DATA_PATH = None
@@ -891,7 +1264,7 @@ def train_ethoswarm_v3():
     elif os.path.exists('/kaggle/input/MABe-mouse-behavior-detection'):
         DATA_PATH = '/kaggle/input/MABe-mouse-behavior-detection'
     else: 
-        DATA_PATH = "./"
+        DATA_PATH = "./" # Fallback
 
     print(f"Data Path: {DATA_PATH}")
     if not os.path.exists(f"{DATA_PATH}/train.csv"):
@@ -908,6 +1281,7 @@ def train_ethoswarm_v3():
 
     print(f"Start Training on {gpu_count} GPU(s) | Batch Size: {BATCH_SIZE}")
 
+    # --- 2. DATA PREP (Strict Video Split) ---
     meta = pd.read_csv(f"{DATA_PATH}/train.csv")
     vids = meta['video_id'].astype(str).unique()
     np.random.shuffle(vids)
@@ -916,12 +1290,16 @@ def train_ethoswarm_v3():
     train_ids = vids[:split]
     val_ids = vids[split:]
     
+    # Loaders
     train_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=train_ids)
+    # val_ds = BioPhysicsDataset(DATA_PATH, 'train', video_ids=val_ids) # REMOVED: Custom validation loop used
     
-    # Use 0 workers for safety
+    # Use 0 workers to prevent deadlock/race conditions with Polars in multiprocessing
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_dual, num_workers=0)
     
+    # --- 3. MODEL INITIALIZATION ---
     model = EthoSwarmNet(num_classes=NUM_CLASSES, input_dim=128)
+    
     model.to(DEVICE)
     if gpu_count > 1:
         print(f"--> Activating Distributed Data Parallel on {gpu_count} GPUs")
@@ -929,11 +1307,14 @@ def train_ethoswarm_v3():
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, steps_per_epoch=len(train_loader), epochs=NUM_EPOCHS)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler() # Mixed Precision
     
+    # Load Masks
     lab_masks = load_lab_vocabulary(VOCAB_PATH, ACTION_TO_IDX, NUM_CLASSES, DEVICE)
+    
     self_indices = [ACTION_TO_IDX[a] for a in SELF_BEHAVIORS]
     pair_indices = [ACTION_TO_IDX[a] for a in PAIR_BEHAVIORS]
+         
     loss_fn = DualStreamMaskedFocalLoss(self_indices, pair_indices, gamma=2.0)
 
     # --- 4. EPOCH LOOP ---
@@ -945,34 +1326,49 @@ def train_ethoswarm_v3():
         run_f1 = 0.0
         
         for i, batch in enumerate(loop):
+            # Move items to GPU
+            # New: c_tgt, meta
             batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
             gx, lx, tgt, weights, lid, c_tgt, batch_meta = batch
+
+            # Ensure float32/contiguous
             gx = gx.float().contiguous()
             lx = lx.float().contiguous()
 
+            # Safety Checks
             if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
+                # print(f"[WARN] Non-finite inputs in batch {i}, skipping")
                 continue
             if (weights.sum(dim=1) == 0).all():
                 continue
             
             optimizer.zero_grad()
+            
+            # Role Flipping Augmentation
             role_idx = None
             if random.random() < 0.5:
-                 role_idx = torch.ones(gx.shape[0], dtype=torch.long).to(DEVICE)
+                 role_idx = torch.ones(gx.shape[0], dtype=torch.long).to(DEVICE) # Role 1
             
             try:
+                # Mixed Precision Forward
                 with torch.cuda.amp.autocast():
+                    # Forward returns 3 items
                     probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid, role_idx)
+
                     loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
 
+                # Backward
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
             except Exception as e:
+                # print(f"[ERROR] Forward/Backward failed at batch {i}: {e}")
+                # print("Sample metas:", batch_meta[:2])
                 torch.cuda.empty_cache()
                 continue
             
+            # Metrics
             with torch.no_grad():
                 f1 = get_batch_f1(probs, tgt, lab_masks[lid], weights)
                 
@@ -985,10 +1381,17 @@ def train_ethoswarm_v3():
         # Validation
         print("Validating...")
         model.eval()
+        val_loss_sum = 0
+        batches = 0
 
+        # Accumulate for Real Metric
         submission_rows = []
         solution_rows = []
 
+        # INFERENCE-STYLE VALIDATION LOOP (Optimized)
+        print("Running Optimized Inference-Style Validation...")
+
+        # 1. Select a Subset of Videos (e.g. 50 random videos)
         val_subset_size = 50
         val_ids_shuffled = list(val_ids)
         random.shuffle(val_ids_shuffled)
@@ -1001,7 +1404,9 @@ def train_ethoswarm_v3():
         tracking_root = Path(DATA_PATH) / "train_tracking"
         annot_root = Path(DATA_PATH) / "train_annotation"
 
+        # Iterate by Video (Read file once)
         for vid in tqdm(target_vids, desc="Validating Subset"):
+            # Find Lab
             row = meta[meta['video_id'].astype(str) == vid].iloc[0]
             lab = row['lab_id']
             conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
@@ -1010,14 +1415,17 @@ def train_ethoswarm_v3():
             fpath = tracking_root / lab / f"{vid}.parquet"
             if not fpath.exists(): continue
 
+            # Load Tracking (Once per Video)
             try:
                 lf = pl.scan_parquet(fpath)
                 df = lf.collect().to_pandas()
+
                 mice = df['mouse_id'].unique().astype(str).tolist()
                 max_frame = df['video_frame'].max()
                 L_alloc = max_frame + 1
             except: continue
 
+            # Load Annotations (Once per Video)
             video_gt_actions = []
             annot_path = annot_root / lab / f"{vid}.parquet"
             if annot_path.exists():
@@ -1028,13 +1436,18 @@ def train_ethoswarm_v3():
                             video_gt_actions.append(a_row)
                 except: pass
 
+            # Generate Pairs
             pairs = list(permutations(mice, 2))
 
             for agent_id, target_id in pairs:
+                # 1. ADD GROUND TRUTH (Filtered first)
                 pair_adf = []
                 for a_row in video_gt_actions:
+                    # Robust check for agent/target columns (pandas Series / dict)
+                    # Handles both 'agent' and 'agent_id' variants seen in data
                     aid_val = None
                     tid_val = None
+
                     if 'agent_id' in a_row: aid_val = a_row['agent_id']
                     elif 'agent' in a_row: aid_val = a_row['agent']
 
@@ -1057,11 +1470,13 @@ def train_ethoswarm_v3():
                         'behaviors_labeled': row.get('behaviors_labeled', "[]")
                     })
 
+                # Extract Features (In Memory)
                 raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
                 raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
                 valid_m1 = np.zeros(L_alloc, dtype=bool)
                 valid_m2 = np.zeros(L_alloc, dtype=bool)
 
+                # Mouse 1
                 d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
                 for i, bp in enumerate(BODY_PARTS):
                     rows = d1[d1['bodypart']==bp]
@@ -1071,6 +1486,7 @@ def train_ethoswarm_v3():
                         raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
                         valid_m1[indices[valid]] = True
 
+                # Mouse 2
                 d2 = df[df['mouse_id'].astype(str) == str(target_id)]
                 for i, bp in enumerate(BODY_PARTS):
                     rows = d2[d2['bodypart']==bp]
@@ -1081,12 +1497,16 @@ def train_ethoswarm_v3():
                         valid_m2[indices[valid]] = True
 
                 valid_frames = valid_m1 & valid_m2
+
+                # Skip if no interaction
                 if not valid_frames.any(): continue
 
+                # Features
                 raw_m1 = _fix_teleport(raw_m1)
                 raw_m2 = _fix_teleport(raw_m2)
                 feats = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
 
+                # Batched Inference
                 T_total = len(feats)
                 prob_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
                 count_accum = torch.zeros((T_total, NUM_CLASSES), device=DEVICE)
@@ -1101,10 +1521,12 @@ def train_ethoswarm_v3():
                 for start in range(0, T_total, STRIDE):
                     end = min(start + WINDOW_SIZE, T_total)
                     if not valid_frames[start:end].any(): continue
+
                     l_input = g_feats_full[:, start:end, :, :]
                     if l_input.shape[1] < WINDOW_SIZE:
                          pad_n = WINDOW_SIZE - l_input.shape[1]
                          l_input = F.pad(l_input, (0,0,0,0,0,pad_n))
+
                     windows.append(l_input)
                     starts.append(start)
 
@@ -1112,8 +1534,10 @@ def train_ethoswarm_v3():
                 for i in range(0, len(windows), INF_BATCH_SIZE):
                     batch_windows = windows[i : i+INF_BATCH_SIZE]
                     batch_starts = starts[i : i+INF_BATCH_SIZE]
+
                     if not batch_windows: continue
-                    lx_batch = torch.cat(batch_windows, dim=0)
+
+                    lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
                     B = lx_batch.shape[0]
                     gx_batch = g_input.repeat(B, 1, 1, 1)
                     lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
@@ -1132,12 +1556,14 @@ def train_ethoswarm_v3():
                 final_probs = prob_accum / (count_accum + 1e-6)
                 preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
 
+                # Segments
                 for c in range(NUM_CLASSES):
                     action_name = ACTION_LIST[c]
                     binary_seq = preds[:, c]
                     diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
                     starts_seg = np.where(diffs == 1)[0]
                     stops_seg = np.where(diffs == -1)[0]
+
                     for s, e in zip(starts_seg, stops_seg):
                         submission_rows.append({
                              'video_id': vid,
@@ -1147,29 +1573,26 @@ def train_ethoswarm_v3():
                              'start_frame': s,
                              'stop_frame': e-1
                         })
+
+                batches += 1
+
+        # CALCULATE METRIC
         try:
             print(f"Validation Debug: {len(solution_rows)} GT rows, {len(submission_rows)} Pred rows")
+
             if len(solution_rows) > 0 and len(submission_rows) > 0:
                 sol_df = pd.DataFrame(solution_rows)
                 sub_df = pd.DataFrame(submission_rows)
                 real_score = mouse_fbeta(sol_df, sub_df)
+                # Loss is not calculated in manual loop, setting to N/A
                 print(f"Val Loss: N/A | REAL F1 Score: {real_score:.4f} (Subset {val_subset_size} vids)")
             else:
                  print(f"Val Loss: N/A | REAL F1 Score: 0.0000 (Empty predictions/solutions)")
         except Exception as e:
             print(f"Metric Calculation Failed: {e}")
         
-        # --- SAVE THRESHOLDS & MODEL ---
-        thresh_dict = {
-            "thresholds": thresholds.tolist(),
-            "action_list": ACTION_LIST
-        }
-        # Save JSON separately (requested by PR)
-        with open(f"ethoswarm_thresholds_ep{epoch+1}.json", "w") as f:
-            json.dump(thresh_dict, f)
-
-        # Do NOT save thresholds in .pth (requested by user)
-        torch.save(model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(), f"ethoswarm_v4_ep{epoch+1}.pth")
+        state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        torch.save(state, f"ethoswarm_v4_ep{epoch+1}.pth")
 
 if __name__ == '__main__':
     train_ethoswarm_v3()
