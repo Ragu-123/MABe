@@ -610,9 +610,9 @@ def run_inference():
         # 1. Compute Global Embedding for entire video (subsampled)
         g_feats_full = feats.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
 
-        # Subsample for Global Stream (every 30th frame ~ 1FPS)
-        g_input = g_feats_full[:, ::30, :, :]
-        if g_input.shape[1] == 0: g_input = g_feats_full
+        # NOTE: Training uses gx=lx (local window).
+        # Using subsampled global video here causes distribution shift.
+        # We switch to gx=lx to match training distribution.
 
         # 2. Loop Windows for Local (Batched)
         windows = []
@@ -644,7 +644,10 @@ def run_inference():
             # Stack
             lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
             B = lx_batch.shape[0]
-            gx_batch = g_input.repeat(B, 1, 1, 1)
+
+            # MATCH TRAINING: Global Input = Local Input
+            gx_batch = lx_batch
+
             lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
 
             with torch.no_grad():
