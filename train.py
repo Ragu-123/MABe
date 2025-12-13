@@ -789,6 +789,10 @@ class EthoSwarmNet(nn.Module):
         return torch.tensor(indices, dtype=torch.long)
 
     def forward(self, global_agent, global_target, local_agent, local_target, lab_idx, role_idx=None):
+        """
+        The V4 Forward Pass:
+        Global/Local Streams -> Topology -> Split -> Time -> Logic -> Stitch
+        """
         # --- CRITICAL FIX: NaN Safety ---
         global_agent = torch.nan_to_num(global_agent, nan=0.0)
         global_target = torch.nan_to_num(global_target, nan=0.0)
@@ -1160,15 +1164,12 @@ def train_ethoswarm_v3():
             "thresholds": thresholds.tolist(),
             "action_list": ACTION_LIST
         }
+        # Save JSON separately (requested by PR)
         with open(f"ethoswarm_thresholds_ep{epoch+1}.json", "w") as f:
             json.dump(thresh_dict, f)
 
-        state = {
-            "model_state": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
-            "thresholds": thresholds,
-            "epoch": epoch
-        }
-        torch.save(state, f"ethoswarm_v4_ep{epoch+1}.pth")
+        # Do NOT save thresholds in .pth (requested by user)
+        torch.save(model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(), f"ethoswarm_v4_ep{epoch+1}.pth")
 
 if __name__ == '__main__':
     train_ethoswarm_v3()
