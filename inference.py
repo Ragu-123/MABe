@@ -270,7 +270,17 @@ class BioPhysicsDataset(Dataset):
             # Feature Extraction
             feats = self._geo_feats(raw_m1, raw_m2, conf['pix_cm'])
 
-            lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+            # CRITICAL FIX: Use sorted keys to match load_lab_vocabulary
+            # And fallback to DEFAULT if lab not found
+            sorted_labs = sorted(list(LAB_CONFIGS.keys()))
+            if lab in sorted_labs:
+                lab_idx = sorted_labs.index(lab)
+            else:
+                # Fallback to DEFAULT
+                if 'DEFAULT' in sorted_labs:
+                    lab_idx = sorted_labs.index('DEFAULT')
+                else:
+                    lab_idx = 0 # Fallback to first if DEFAULT missing (unlikely)
 
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
