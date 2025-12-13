@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import math
+import polars as pl
+import pyarrow.parquet as pq
 
 # ==============================================================================
 # 1. SHARED CONFIGURATION & DATA (Copied exactly from train.py)
@@ -89,9 +91,35 @@ class BioPhysicsDataset(Dataset):
                         self.samples.append({
                             'video_id': vid,
                             'lab_id': lab,
-                            'agent_id': agent,
-                            'target_id': target
+                            'agent_id': str(agent), # FORCE STRING
+                            'target_id': str(target) # FORCE STRING
                         })
+
+        # --- Filter Bad Samples ---
+        def _quick_parquet_has_frames(path):
+            try:
+                pf = pq.ParquetFile(str(path))
+                md = pf.metadata
+                if md.num_rows == 0:
+                    return False
+                try:
+                    col_names = pf.schema_arrow.names
+                    if 'video_frame' in col_names:
+                        return True
+                    return True
+                except:
+                    return True
+            except:
+                return False
+
+        print("Filtering invalid videos...")
+        filtered = []
+        for s in self.samples:
+            p = self.tracking_dir / s['lab_id'] / f"{s['video_id']}.parquet"
+            if p.exists() and _quick_parquet_has_frames(p):
+                filtered.append(s)
+        self.samples = filtered
+        print(f"Retained {len(self.samples)} valid samples.")
 
     def _fix_teleport(self, pos):
         T, N, _ = pos.shape
@@ -180,34 +208,60 @@ class BioPhysicsDataset(Dataset):
             return None, None, None, None, None
 
         try:
-            df = pd.read_parquet(fpath)
+            # Polars Optimization
+            lf = pl.scan_parquet(fpath)
 
-            # Identify Agents based on sample
-            d1_full = df[df['mouse_id']==agent_id]
-            d2_full = df[df['mouse_id']==target_id]
+            # 1. Get Limits
+            meta_df = lf.select(pl.col('video_frame').max()).collect()
+            if meta_df.shape[0] == 0 or meta_df.item(0, 0) is None:
+                 return None, None, None, None, None
 
-            if d1_full.empty or d2_full.empty:
+            max_frame = meta_df.item(0, 0)
+            L_alloc = max_frame + 1
+
+            # 2. Fetch Data for this Pair
+            q = (
+                lf
+                .filter(
+                    pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)])
+                )
+                .collect()
+            )
+
+            if q.is_empty():
                 return None, None, None, None, None
 
-            # Simple Pivot
-            p1 = d1_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
-            p2 = d2_full.pivot_table(index='frame', columns='bodypart', values=['x', 'y'])
+            df = q.to_pandas()
 
-            # Align indices
-            common_index = p1.index.union(p2.index).sort_values()
-            p1 = p1.reindex(common_index).fillna(method='ffill').fillna(0)
-            p2 = p2.reindex(common_index).fillna(method='ffill').fillna(0)
+            raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+            raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-            raw_m1 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
-            raw_m2 = np.zeros((len(common_index), 11, 2), dtype=np.float32)
+            # Validity Masks
+            valid_m1 = np.zeros(L_alloc, dtype=bool)
+            valid_m2 = np.zeros(L_alloc, dtype=bool)
 
+            # Mouse 1
+            d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
             for i, bp in enumerate(BODY_PARTS):
-                if ('x', bp) in p1.columns:
-                    raw_m1[:, i, 0] = p1[('x', bp)].values
-                    raw_m1[:, i, 1] = p1[('y', bp)].values
-                if ('x', bp) in p2.columns:
-                    raw_m2[:, i, 0] = p2[('x', bp)].values
-                    raw_m2[:, i, 1] = p2[('y', bp)].values
+                rows = d1[d1['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m1[indices[valid]] = True
+
+            # Mouse 2
+            d2 = df[df['mouse_id'].astype(str) == str(target_id)]
+            for i, bp in enumerate(BODY_PARTS):
+                rows = d2[d2['bodypart']==bp]
+                if not rows.empty:
+                    indices = rows['video_frame'].values
+                    valid = (indices >= 0) & (indices < L_alloc)
+                    raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
+                    valid_m2[indices[valid]] = True
+
+            # Intersection of presence
+            valid_frames = valid_m1 & valid_m2
 
             # Fix Teleport
             raw_m1 = self._fix_teleport(raw_m1)
@@ -218,13 +272,24 @@ class BioPhysicsDataset(Dataset):
 
             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, common_index.values
+            # Frames: Just indices since we don't have 'frame' column
+            frames = np.arange(L_alloc)
+
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
             return None, None, None, None, None
 
     def __len__(self): return len(self.samples)
+
+class ValidationDataset(Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return self.ds.load_full_video_features_for_pair(idx)
 
 # ==============================================================================
 # 2. MODEL ARCHITECTURE (Copied exactly from train.py)
@@ -478,10 +543,14 @@ def run_inference():
     WINDOW_SIZE = 256
     STRIDE = 128
 
+    # Parallel Loader
+    val_dataset_full = ValidationDataset(ds)
+    val_loader_full = torch.utils.data.DataLoader(val_dataset_full, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
+
     print(f"Starting Inference on {len(ds)} samples...")
-    for i in range(len(ds)):
+    for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames = ds.load_full_video_features_for_pair(i)
+        feats, lab_idx, agent_id, target_id, frames, valid_mask = batch_data
 
         if feats is None: continue
 
@@ -498,62 +567,136 @@ def run_inference():
         g_input = g_feats_full[:, ::30, :, :]
         if g_input.shape[1] == 0: g_input = g_feats_full
 
-        # 2. Loop Windows for Local
+        # 2. Loop Windows for Local (Batched)
+        windows = []
+        starts = []
+
         for start in range(0, T_total, STRIDE):
             end = min(start + WINDOW_SIZE, T_total)
 
+            # Skip empty windows (no tracking data)
+            if not valid_mask[start:end].any():
+                continue
+
             l_input = g_feats_full[:, start:end, :, :]
-            lid_tensor = torch.tensor([lab_idx]).to(DEVICE)
+            if l_input.shape[1] < WINDOW_SIZE:
+                 pad_n = WINDOW_SIZE - l_input.shape[1]
+                 l_input = F.pad(l_input, (0,0,0,0,0,pad_n))
+
+            windows.append(l_input)
+            starts.append(start)
+
+        # Process in Batches
+        INF_BATCH_SIZE = 32
+        for i in range(0, len(windows), INF_BATCH_SIZE):
+            batch_windows = windows[i : i+INF_BATCH_SIZE]
+            batch_starts = starts[i : i+INF_BATCH_SIZE]
+
+            if not batch_windows: continue
+
+            # Stack
+            lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
+            B = lx_batch.shape[0]
+            gx_batch = g_input.repeat(B, 1, 1, 1)
+            lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
 
             with torch.no_grad():
-                 # Forward returns 3 items, unpack
-                 probs, _, _ = model(g_input, g_input, l_input, l_input, lid_tensor)
-                 # probs: [1, L, 37]
+                probs, _, _ = model(gx_batch, gx_batch, lx_batch, lx_batch, lid_batch)
 
-            prob_accum[start:end] += probs[0]
-            count_accum[start:end] += 1.0
+            # Accumulate
+            for b in range(B):
+                start = batch_starts[b]
+                end = min(start + WINDOW_SIZE, T_total)
+                valid_len = end - start
+                prob_accum[start:end] += probs[b, :valid_len]
+                count_accum[start:end] += 1.0
 
         # Average
         final_probs = prob_accum / (count_accum + 1e-6)
 
-        # Thresholding
-        preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
+        # Post-Processing: Single Action Selection + Lab Masking
 
-        # Generate Submission Rows
-        vid = ds.samples[i]['video_id']
+        # 1. Apply Lab Mask
+        if lab_idx < len(lab_masks):
+            mask = lab_masks[lab_idx].unsqueeze(0)
+            final_probs = final_probs * mask
 
-        for c in range(37):
-            action_name = ACTION_LIST[c]
-            binary_seq = preds[:, c]
+        # 2. Select Single Best Action per Frame (Argmax)
+        # probs: [T, 37]
+        # We use a global threshold for "background" (no action)
+        GLOBAL_THRESH = 0.4
 
-            # RLE
-            diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
-            starts = np.where(diffs == 1)[0]
-            stops = np.where(diffs == -1)[0]
+        best_probs, best_idx = torch.max(final_probs, dim=1) # [T]
 
-            for s, e in zip(starts, stops):
-                real_start = frames[s]
-                real_stop = frames[e-1]
+        # Filter weak predictions
+        valid_frames = best_probs > GLOBAL_THRESH
 
-                # Resolve Target ID
-                final_target = target_id
-                if action_name in SELF_BEHAVIORS:
-                    final_target = 'self'
-                else:
-                    if target_id == agent_id: final_target = 'self'
+        pred_indices = best_idx.cpu().numpy()
+        valid_mask_np = valid_frames.cpu().numpy()
 
-                # Format
-                ag_str = f"mouse{agent_id}" if isinstance(agent_id, int) else agent_id
-                if final_target == 'self':
-                    tg_str = 'self'
-                else:
-                    tg_str = f"mouse{final_target}" if isinstance(final_target, int) else final_target
+        # Generate Segments
+        # We iterate through time and group consecutive identical predictions
 
+        current_action = None
+        start_f = 0
+
+        # We'll use a simple loop over T_total
+        for t in range(T_total):
+            if not valid_mask_np[t]:
+                label = -1 # Background
+            else:
+                label = pred_indices[t]
+
+            if label != current_action:
+                # Close previous segment
+                if current_action is not None and current_action != -1:
+                    stop_f = t # Exclusive stop
+
+                    real_start = frames[start_f]
+                    # frames array might be padded or offset?
+                    # frames is np.arange(L_alloc) from loader, so it maps directly.
+                    # Safety check
+                    if stop_f > len(frames): stop_f = len(frames)
+                    if start_f >= len(frames): continue # Should not happen if T_total matches
+
+                    real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
+
+                    # Store
+                    action_name = ACTION_LIST[current_action]
+
+                    # Resolve Target ID (Logic from original)
+                    final_target = target_id
+                    # Standardize MABe format: usually just raw agent/target IDs
+                    # We use the string versions directly from sample
+
+                    submission_rows.append([
+                         0,
+                         vid,
+                         str(agent_id),
+                         str(final_target),
+                         action_name,
+                         real_start,
+                         real_stop
+                    ])
+
+                # Start new
+                current_action = label
+                start_f = t
+
+        # Close final segment
+        if current_action is not None and current_action != -1:
+            stop_f = T_total
+            if start_f < len(frames):
+                if stop_f > len(frames): stop_f = len(frames)
+                real_start = frames[start_f]
+                real_stop = frames[stop_f-1] + 1
+
+                action_name = ACTION_LIST[current_action]
                 submission_rows.append([
-                     0, # Row ID placeholder
+                     0,
                      vid,
-                     ag_str,
-                     tg_str,
+                     str(agent_id),
+                     str(target_id),
                      action_name,
                      real_start,
                      real_stop
