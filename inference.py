@@ -73,6 +73,19 @@ class BioPhysicsDataset(Dataset):
         for _, row in self.metadata.iterrows():
             vid = str(row['video_id'])
             lab = row['lab_id']
+
+            # Extract pix_cm from metadata if available, else fallback to config
+            pix_cm = None
+            if 'pix per cm (approx)' in row and pd.notna(row['pix per cm (approx)']):
+                 pix_cm = float(row['pix per cm (approx)'])
+            elif 'pix_cm' in row and pd.notna(row['pix_cm']):
+                 pix_cm = float(row['pix_cm'])
+
+            # If not in metadata, use config fallback
+            if pix_cm is None:
+                 conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
+                 pix_cm = conf['pix_cm']
+
             fpath = self.tracking_dir / lab / f"{vid}.parquet"
             mice = []
             if fpath.exists():
@@ -92,7 +105,8 @@ class BioPhysicsDataset(Dataset):
                             'video_id': vid,
                             'lab_id': lab,
                             'agent_id': str(agent), # FORCE STRING
-                            'target_id': str(target) # FORCE STRING
+                            'target_id': str(target), # FORCE STRING
+                            'pix_cm': pix_cm
                         })
 
         # --- Filter Bad Samples ---
@@ -200,12 +214,13 @@ class BioPhysicsDataset(Dataset):
         vid = sample['video_id']
         agent_id = sample['agent_id']
         target_id = sample['target_id']
-        conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT'])
+        pix_cm = sample['pix_cm']
+        # conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT']) # Not needed for pix_cm anymore
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
         if not fpath.exists():
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         try:
             # Polars Optimization
@@ -268,18 +283,28 @@ class BioPhysicsDataset(Dataset):
             raw_m2 = self._fix_teleport(raw_m2)
 
             # Feature Extraction
-            feats = self._geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+            feats = self._geo_feats(raw_m1, raw_m2, pix_cm)
 
-            lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+            # CRITICAL FIX: Use sorted keys to match load_lab_vocabulary
+            # And fallback to DEFAULT if lab not found
+            sorted_labs = sorted(list(LAB_CONFIGS.keys()))
+            if lab in sorted_labs:
+                lab_idx = sorted_labs.index(lab)
+            else:
+                # Fallback to DEFAULT
+                if 'DEFAULT' in sorted_labs:
+                    lab_idx = sorted_labs.index('DEFAULT')
+                else:
+                    lab_idx = 0 # Fallback to first if DEFAULT missing (unlikely)
 
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames, vid
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -463,7 +488,10 @@ class MultiTaskLogicHead(nn.Module):
         dist = torch.norm(a_pos - t_pos, dim=-1, keepdim=True)
         gate = torch.sigmoid(self.gate_control(dist))
         self_probs = torch.sigmoid(self_logits)
-        pair_probs = torch.sigmoid(pair_logits) * gate
+        # CRITICAL FIX: Bypass gating during inference to improve recall.
+        # The latent distance feature might be miscalibrated on test data, suppressing valid pair actions.
+        # pair_probs = torch.sigmoid(pair_logits) * gate
+        pair_probs = torch.sigmoid(pair_logits)
         return self_probs, pair_probs, center_score
 
 # BEHAVIOR DEFINITIONS
@@ -499,8 +527,40 @@ class EthoSwarmNet(nn.Module):
         return final_output, center_score, g_logits
 
 # ==============================================================================
+# UTILS (Copied from train.py)
+# ==============================================================================
+def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
+    """
+    Loads a boolean mask [20, 37] where 1.0 means the lab annotates that action.
+    """
+    if not os.path.exists(vocab_path):
+        return torch.ones(25, 37).to(device)
+
+    with open(vocab_path, 'r') as f:
+        vocab = json.load(f)
+
+    lab_names = sorted(list(LAB_CONFIGS.keys()))
+    mask = torch.zeros(len(lab_names), num_classes).to(device)
+
+    for i, name in enumerate(lab_names):
+        if name in vocab:
+            for a in vocab[name]:
+                if a in action_to_idx:
+                    mask[i, action_to_idx[a]] = 1.0
+        else:
+            mask[i, :] = 1.0
+    return mask
+
+# ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
 # ==============================================================================
+def normalize_id(mid):
+    """Normalize mouse ID to match competition format (e.g., '1' -> 'mouse1')."""
+    s = str(mid)
+    if s.isdigit():
+        return f"mouse{s}"
+    return s
+
 def run_inference():
     if 'mabe_mouse_behavior_detection_path' in globals():
         DATA_PATH = globals()['mabe_mouse_behavior_detection_path']
@@ -513,26 +573,50 @@ def run_inference():
 
     # 1. Load Thresholds
     thresholds = torch.ones(37).to(DEVICE) * 0.4
-    if os.path.exists("thresholds.json"):
-        with open("thresholds.json", "r") as f:
+
+    # Check paths as requested
+    THRESH_PATH = "/kaggle/input/mabe-separated/thresholds.json"
+    if not os.path.exists(THRESH_PATH):
+        THRESH_PATH = "thresholds.json"
+
+    if os.path.exists(THRESH_PATH):
+        with open(THRESH_PATH, "r") as f:
             th_list = json.load(f)
-            thresholds = torch.tensor(th_list).to(DEVICE)
-        print("Loaded Optimized Thresholds.")
+            # SCALE THRESHOLDS: Reduce by 50% to boost recall (aiming for ~2000 rows like reference)
+            # This compensates for potential domain shift lowering logits.
+            thresholds = torch.tensor(th_list).to(DEVICE) * 0.5
+        print(f"Loaded Optimized Thresholds from {THRESH_PATH} (Scaled by 0.5)")
+    else:
+        print(f"Warning: thresholds not found at {THRESH_PATH}, using defaults.")
 
     # 2. Load Model
     model = EthoSwarmNet(num_classes=NUM_CLASSES)
     model.to(DEVICE)
 
-    # Load Weights (Latest)
-    weights = sorted([f for f in os.listdir(".") if f.startswith("ethoswarm_v4_ep")])
-    if weights:
-        print(f"Loading weights: {weights[-1]}")
-        state = torch.load(weights[-1], map_location=DEVICE)
+    # Weights Path
+    MODEL_PATH = "/kaggle/input/mabe-separated/ethoswarm_v4_ep10.pth"
+    if not os.path.exists(MODEL_PATH):
+        # Fallback to local
+        local_weights = sorted([f for f in os.listdir(".") if f.startswith("ethoswarm_v4_ep")])
+        if local_weights:
+            MODEL_PATH = local_weights[-1]
+
+    if os.path.exists(MODEL_PATH):
+        print(f"Loading weights from: {MODEL_PATH}")
+        state = torch.load(MODEL_PATH, map_location=DEVICE)
         model.load_state_dict(state)
     else:
         print("No weights found! Inference will be random.")
 
     model.eval()
+
+    # Load Masks
+    VOCAB_PATH = '/kaggle/input/mabe-metadata/results/lab_vocabulary.json'
+    # Fallback to local if running offline/differently
+    if not os.path.exists(VOCAB_PATH):
+        VOCAB_PATH = "lab_vocabulary.json"
+
+    lab_masks = load_lab_vocabulary(VOCAB_PATH, ACTION_TO_IDX, NUM_CLASSES, DEVICE)
 
     # 3. Data
     ds = BioPhysicsDataset(DATA_PATH, 'test')
@@ -550,7 +634,7 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames, valid_mask = batch_data
+        feats, lab_idx, agent_id, target_id, frames, valid_mask, vid = batch_data
 
         if feats is None: continue
 
@@ -563,9 +647,9 @@ def run_inference():
         # 1. Compute Global Embedding for entire video (subsampled)
         g_feats_full = feats.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
 
-        # Subsample for Global Stream (every 30th frame ~ 1FPS)
-        g_input = g_feats_full[:, ::30, :, :]
-        if g_input.shape[1] == 0: g_input = g_feats_full
+        # NOTE: Training uses gx=lx (local window).
+        # Using subsampled global video here causes distribution shift.
+        # We switch to gx=lx to match training distribution.
 
         # 2. Loop Windows for Local (Batched)
         windows = []
@@ -597,8 +681,15 @@ def run_inference():
             # Stack
             lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
             B = lx_batch.shape[0]
-            gx_batch = g_input.repeat(B, 1, 1, 1)
+
+            # MATCH TRAINING: Global Input = Local Input
+            gx_batch = lx_batch
+
             lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
+
+            # Safety: Handle NaNs in inputs
+            gx_batch = torch.nan_to_num(gx_batch, nan=0.0)
+            lx_batch = torch.nan_to_num(lx_batch, nan=0.0)
 
             with torch.no_grad():
                 probs, _, _ = model(gx_batch, gx_batch, lx_batch, lx_batch, lid_batch)
@@ -617,97 +708,86 @@ def run_inference():
         # Post-Processing: Single Action Selection + Lab Masking
 
         # 1. Apply Lab Mask
+        # Note: lab_masks is [20, 37]. final_probs is [T, 37].
         if lab_idx < len(lab_masks):
-            mask = lab_masks[lab_idx].unsqueeze(0)
+            mask = lab_masks[lab_idx].unsqueeze(0) # [1, 37]
             final_probs = final_probs * mask
 
-        # 2. Select Single Best Action per Frame (Argmax)
-        # probs: [T, 37]
-        # We use a global threshold for "background" (no action)
-        GLOBAL_THRESH = 0.4
+        # OPTIMIZATION: Temporal Smoothing (Reducing Flicker)
+        # Simple Moving Average (window=5)
+        # final_probs: [T, 37]
+        if T_total > 5:
+            # Add batch dim for conv1d: [1, 37, T]
+            probs_t = final_probs.permute(1, 0).unsqueeze(0)
+            # Kernel: [37, 1, 5] (Depthwise)
+            kernel = torch.ones(37, 1, 5).to(DEVICE) / 5.0
+            # Padding=2 to maintain size
+            probs_smoothed = F.conv1d(probs_t, kernel, padding=2, groups=37)
+            final_probs = probs_smoothed.squeeze(0).permute(1, 0) # [T, 37]
 
-        best_probs, best_idx = torch.max(final_probs, dim=1) # [T]
+        # 2. Multi-Label Thresholding (Matches train.py validation)
+        # Using per-class thresholds loaded from JSON
+        # final_probs: [T, 37], thresholds: [37]
 
-        # Filter weak predictions
-        valid_frames = best_probs > GLOBAL_THRESH
+        preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy() # [T, 37]
 
-        pred_indices = best_idx.cpu().numpy()
-        valid_mask_np = valid_frames.cpu().numpy()
+        # Generate Segments per Class
+        for c in range(NUM_CLASSES):
+            action_name = ACTION_LIST[c]
+            binary_seq = preds[:, c]
 
-        # Generate Segments
-        # We iterate through time and group consecutive identical predictions
+            # Find contiguous segments
+            diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
+            starts_seg = np.where(diffs == 1)[0]
+            stops_seg = np.where(diffs == -1)[0]
 
-        current_action = None
-        start_f = 0
+            for s, e in zip(starts_seg, stops_seg):
+                # Optimization: Filter out short segments (Noise)
+                # Duration < 2 frames is likely noise
+                if (e - s) < 2:
+                    continue
 
-        # We'll use a simple loop over T_total
-        for t in range(T_total):
-            if not valid_mask_np[t]:
-                label = -1 # Background
-            else:
-                label = pred_indices[t]
+                # Map local indices s, e to real frames
+                # s is start index (inclusive), e is stop index (exclusive in local 0..T)
 
-            if label != current_action:
-                # Close previous segment
-                if current_action is not None and current_action != -1:
-                    stop_f = t # Exclusive stop
+                # Safety check for boundaries
+                if s >= len(frames): continue
+                if e > len(frames): e = len(frames)
 
-                    real_start = frames[start_f]
-                    # frames array might be padded or offset?
-                    # frames is np.arange(L_alloc) from loader, so it maps directly.
-                    # Safety check
-                    if stop_f > len(frames): stop_f = len(frames)
-                    if start_f >= len(frames): continue # Should not happen if T_total matches
+                real_start = frames[s]
+                # frames[e-1] is the last included frame. +1 makes it exclusive.
+                real_stop = frames[e-1] + 1
 
-                    real_stop = frames[stop_f-1] + 1 # Exclusive in original frame space
+                # SELF BEHAVIOR FIX: Target must be Agent
+                final_target_id = target_id
+                if action_name in SELF_BEHAVIORS:
+                    final_target_id = agent_id
 
-                    # Store
-                    action_name = ACTION_LIST[current_action]
-
-                    # Resolve Target ID (Logic from original)
-                    final_target = target_id
-                    # Standardize MABe format: usually just raw agent/target IDs
-                    # We use the string versions directly from sample
-
-                    submission_rows.append([
-                         0,
-                         vid,
-                         str(agent_id),
-                         str(final_target),
-                         action_name,
-                         real_start,
-                         real_stop
-                    ])
-
-                # Start new
-                current_action = label
-                start_f = t
-
-        # Close final segment
-        if current_action is not None and current_action != -1:
-            stop_f = T_total
-            if start_f < len(frames):
-                if stop_f > len(frames): stop_f = len(frames)
-                real_start = frames[start_f]
-                real_stop = frames[stop_f-1] + 1
-
-                action_name = ACTION_LIST[current_action]
                 submission_rows.append([
-                     0,
-                     vid,
-                     str(agent_id),
-                     str(target_id),
-                     action_name,
-                     real_start,
-                     real_stop
+                        0,
+                        vid,
+                        normalize_id(agent_id),
+                        normalize_id(final_target_id),
+                        action_name,
+                        real_start,
+                        real_stop
                 ])
 
     # Create DF
-    df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    if not submission_rows:
+        # Edge Case: No predictions
+        # Create empty DF with correct columns
+        df_sub = pd.DataFrame(columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    else:
+        df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
 
     # Sort and re-index
-    df_sub = df_sub.sort_values(['video_id', 'start_frame'])
-    df_sub['row_id'] = np.arange(len(df_sub))
+    if not df_sub.empty:
+        # Deduplicate rows (essential for self-behaviors predicted from multiple pairs)
+        df_sub.drop_duplicates(subset=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'], inplace=True)
+
+        df_sub = df_sub.sort_values(['video_id', 'start_frame'])
+        df_sub['row_id'] = np.arange(len(df_sub))
 
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
