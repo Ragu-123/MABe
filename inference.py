@@ -11,6 +11,7 @@ import os
 import math
 import polars as pl
 import pyarrow.parquet as pq
+import ast
 
 # ==============================================================================
 # 1. SHARED CONFIGURATION & DATA (Copied exactly from train.py)
@@ -905,16 +906,21 @@ def run_inference():
                         final_agent_id,
                         final_target_id,
                         action_name,
-                        real_start,
-                        real_stop
+                        int(real_start), # Ensure int type for submission
+                        int(real_stop)   # Ensure int type for submission
                 ])
 
     # Create DF
     if not submission_rows:
         # Edge Case: No predictions
-        # Create Dummy Row as per reference code to avoid errors
+        # Create Dummy Row with VALID VIDEO ID to avoid foreign key errors in metric
         print("Warning: No predictions generated. Creating dummy row.")
-        submission_rows.append([0, "0", "mouse1", "mouse2", "sniff", 0, 1])
+
+        valid_vid = "0"
+        if len(ds.samples) > 0:
+            valid_vid = ds.samples[0]['video_id']
+
+        submission_rows.append([0, valid_vid, "mouse1", "mouse2", "sniff", 0, 1])
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
     else:
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
