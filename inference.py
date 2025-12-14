@@ -590,6 +590,7 @@ def canonical_mouse_id(x):
     return s
 
 def normalize_id(mid):
+    # Wrapper to maintain existing calls
     return canonical_mouse_id(mid)
 
 def run_inference():
