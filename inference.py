@@ -593,6 +593,53 @@ def normalize_id(mid):
     # Wrapper to maintain existing calls
     return canonical_mouse_id(mid)
 
+def robustify(df, min_duration=2):
+    """
+    Merge overlapping intervals for the same (video, agent, target, action).
+    This handles the case where self-behaviors are predicted from multiple pairs
+    resulting in overlapping segments for the same agent.
+    """
+    if df.empty:
+        return df
+
+    # Sort by keys + start_frame
+    df = df.sort_values(['video_id', 'agent_id', 'target_id', 'action', 'start_frame'])
+
+    new_rows = []
+    # Group by key
+    # Note: groupby preserves order of groups, but we just iterate
+    for key, group in df.groupby(['video_id', 'agent_id', 'target_id', 'action']):
+        # group is sorted by start_frame due to df sort
+        intervals = group[['start_frame', 'stop_frame']].values
+        if len(intervals) == 0: continue
+
+        merged = []
+        curr_start, curr_stop = intervals[0]
+
+        for next_start, next_stop in intervals[1:]:
+            if next_start < curr_stop: # Overlap or contiguous (use <= for contiguous merge if desired, but strict overlap < is safer)
+                # Overlap logic: strictly overlapping if next_start < curr_stop
+                # If next_start == curr_stop, they are contiguous.
+                # Reference logic merges contiguous frames (< 5 gap).
+                # We will merge if they overlap or touch.
+                curr_stop = max(curr_stop, next_stop)
+            else:
+                merged.append((curr_start, curr_stop))
+                curr_start, curr_stop = next_start, next_stop
+        merged.append((curr_start, curr_stop))
+
+        # Unpack key
+        vid, ag, tar, act = key
+        for s, e in merged:
+            # Filter short duration here or assume pre-filtered?
+            # We filter again just in case
+            if (e - s) >= min_duration:
+                new_rows.append([vid, ag, tar, act, s, e])
+
+    # Reconstruct DF
+    new_df = pd.DataFrame(new_rows, columns=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    return new_df
+
 def run_inference():
     if 'mabe_mouse_behavior_detection_path' in globals():
         DATA_PATH = globals()['mabe_mouse_behavior_detection_path']
@@ -638,7 +685,8 @@ def run_inference():
         state = torch.load(MODEL_PATH, map_location=DEVICE)
         model.load_state_dict(state)
     else:
-        print("No weights found! Inference will be random.")
+        # FIX 2: Hard Stop if weights are missing to prevent random inference explosion
+        raise FileNotFoundError(f"Weights not found at {MODEL_PATH}. Aborting to prevent random predictions.")
 
     model.eval()
 
@@ -661,7 +709,8 @@ def run_inference():
 
     # Parallel Loader
     val_dataset_full = ValidationDataset(ds)
-    val_loader_full = torch.utils.data.DataLoader(val_dataset_full, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
+    # FIX 1: Use num_workers=0 to prevent deadlocks with Polars/PyArrow
+    val_loader_full = torch.utils.data.DataLoader(val_dataset_full, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda x: x[0])
 
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
@@ -860,6 +909,10 @@ def run_inference():
     if not df_sub.empty:
         # Deduplicate rows (essential for self-behaviors predicted from multiple pairs)
         df_sub.drop_duplicates(subset=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'], inplace=True)
+
+        # Apply robustify to merge overlaps
+        print("Running robustify to merge overlaps...")
+        df_sub = robustify(df_sub, min_duration=2)
 
         df_sub = df_sub.sort_values(['video_id', 'start_frame'])
         df_sub['row_id'] = np.arange(len(df_sub))
