@@ -70,6 +70,7 @@ class BioPhysicsDataset(Dataset):
         print(f"Scanning {len(self.metadata)} videos for mouse pairs...")
 
         # Scan videos for mice
+        # Scan videos for mice
         for _, row in self.metadata.iterrows():
             vid = str(row['video_id'])
             lab = row['lab_id']
@@ -90,12 +91,31 @@ class BioPhysicsDataset(Dataset):
             mice = []
             if fpath.exists():
                 try:
+                    # Use pandas
                     df_small = pd.read_parquet(fpath, columns=['mouse_id'])
                     mice = df_small['mouse_id'].unique().tolist()
                 except:
                     mice = ['mouse1', 'mouse2']
             else:
                 mice = []
+
+            # Parse 'behaviors_labeled' for task filtering
+            # Format: "[('mouse1','mouse2','sniff'), ...]"
+            active_tasks = set()
+            try:
+                if 'behaviors_labeled' in row and pd.notna(row['behaviors_labeled']):
+                    b_str = row['behaviors_labeled']
+                    if b_str.strip().startswith("["):
+                        tasks = ast.literal_eval(b_str)
+                        for t in tasks:
+                            # t is (agent, target, action)
+                            # Normalize IDs using canonical_mouse_id
+                            a = canonical_mouse_id(t[0])
+                            tgt = canonical_mouse_id(t[1])
+                            act = t[2]
+                            active_tasks.add((a, tgt, act))
+            except:
+                pass # Fallback to all
 
             # Create permutations
             for agent in mice:
@@ -106,7 +126,8 @@ class BioPhysicsDataset(Dataset):
                             'lab_id': lab,
                             'agent_id': str(agent), # FORCE STRING
                             'target_id': str(target), # FORCE STRING
-                            'pix_cm': pix_cm
+                            'pix_cm': pix_cm,
+                            'active_tasks': active_tasks # Pass down
                         })
 
         # --- Filter Bad Samples ---
@@ -215,6 +236,7 @@ class BioPhysicsDataset(Dataset):
         agent_id = sample['agent_id']
         target_id = sample['target_id']
         pix_cm = sample['pix_cm']
+        active_tasks = sample.get('active_tasks', set())
         # conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT']) # Not needed for pix_cm anymore
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
@@ -223,30 +245,26 @@ class BioPhysicsDataset(Dataset):
             return None, None, None, None, None, None
 
         try:
-            # Polars Optimization
-            lf = pl.scan_parquet(fpath)
+            # SWITCH TO PANDAS to avoid Polars compatibility issues on Kaggle
+            df_full = pd.read_parquet(fpath)
 
             # 1. Get Limits
-            meta_df = lf.select(pl.col('video_frame').max()).collect()
-            if meta_df.shape[0] == 0 or meta_df.item(0, 0) is None:
+            if 'video_frame' not in df_full.columns:
                  return None, None, None, None, None
 
-            max_frame = meta_df.item(0, 0)
-            L_alloc = max_frame + 1
+            max_frame = df_full['video_frame'].max()
+            if pd.isna(max_frame):
+                 return None, None, None, None, None, None
+
+            L_alloc = int(max_frame) + 1
 
             # 2. Fetch Data for this Pair
-            q = (
-                lf
-                .filter(
-                    pl.col('mouse_id').cast(pl.Utf8).is_in([str(agent_id), str(target_id)])
-                )
-                .collect()
-            )
+            # Ensure mouse_id is string for filtering
+            df_full['mouse_id'] = df_full['mouse_id'].astype(str)
+            df = df_full[df_full['mouse_id'].isin([str(agent_id), str(target_id)])].copy()
 
-            if q.is_empty():
+            if df.empty:
                 return None, None, None, None, None
-
-            df = q.to_pandas()
 
             raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
             raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
@@ -300,11 +318,11 @@ class BioPhysicsDataset(Dataset):
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames, vid
+            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames, vid, active_tasks
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -554,12 +572,25 @@ def load_lab_vocabulary(vocab_path, action_to_idx, num_classes, device):
 # ==============================================================================
 # 3. INFERENCE ENGINE (Sliding Window & Post-Processing)
 # ==============================================================================
-def normalize_id(mid):
-    """Normalize mouse ID to match competition format (e.g., '1' -> 'mouse1')."""
-    s = str(mid)
+def canonical_mouse_id(x):
+    """Robust ID normalization from reference code."""
+    s = str(x).strip().lower()
+    if s == "self":
+        return "self"
+    if s.startswith("mouse"):
+        tail = s.split("mouse", 1)[1].strip()
+        tail = "".join(ch for ch in tail if ch.isdigit())
+        if tail == "":
+            return "mouse1"
+        return "mouse" + tail
+    if s.startswith("m") and s[1:].isdigit():
+        return "mouse" + s[1:]
     if s.isdigit():
-        return f"mouse{s}"
+        return "mouse" + s
     return s
+
+def normalize_id(mid):
+    return canonical_mouse_id(mid)
 
 def run_inference():
     if 'mabe_mouse_behavior_detection_path' in globals():
@@ -634,7 +665,7 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames, valid_mask, vid = batch_data
+        feats, lab_idx, agent_id, target_id, frames, valid_mask, vid, active_tasks = batch_data
 
         if feats is None: continue
 
@@ -713,6 +744,44 @@ def run_inference():
             mask = lab_masks[lab_idx].unsqueeze(0) # [1, 37]
             final_probs = final_probs * mask
 
+        # 1.5 Apply Task Mask (if behaviors_labeled is present)
+        # This filters actions to only those annotated for this specific video/pair
+        # reducing False Positives significantly.
+        if active_tasks:
+            # We need to filter based on current agent/target
+            # active_tasks contains (agent, target, action) tuples
+            # We must match agent_id, target_id to the task list
+
+            # Normalize IDs for comparison
+            # Reference used canonical_mouse_id
+            norm_agent = canonical_mouse_id(agent_id)
+            norm_target = canonical_mouse_id(target_id)
+
+            # Identify valid actions for this pair
+            valid_actions = set()
+            for (task_a, task_t, task_act) in active_tasks:
+                # Check for direct match
+                if task_a == norm_agent and task_t == norm_target:
+                    valid_actions.add(task_act)
+
+                # Check for Self behaviors (target might be 'self' or same agent)
+                if task_a == norm_agent and (task_t == "self" or task_t == task_a):
+                    # If this is a self behavior, does it apply here?
+                    # We are processing pair (A, B).
+                    # If A does "self", it is valid in this pair context?
+                    # Yes, my code outputs self behaviors.
+                    valid_actions.add(task_act)
+
+            if valid_actions:
+                # Create mask
+                task_mask = torch.zeros(NUM_CLASSES).to(DEVICE)
+                for act in valid_actions:
+                    if act in ACTION_TO_IDX:
+                        task_mask[ACTION_TO_IDX[act]] = 1.0
+
+                # Apply mask (broadcasting)
+                final_probs = final_probs * task_mask.unsqueeze(0)
+
         # OPTIMIZATION: Temporal Smoothing (Reducing Flicker)
         # Simple Moving Average (window=5)
         # final_probs: [T, 37]
@@ -779,8 +848,10 @@ def run_inference():
     # Create DF
     if not submission_rows:
         # Edge Case: No predictions
-        # Create empty DF with correct columns
-        df_sub = pd.DataFrame(columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+        # Create Dummy Row as per reference code to avoid errors
+        print("Warning: No predictions generated. Creating dummy row.")
+        submission_rows.append([0, "0", "mouse1", "mouse2", "sniff", 0, 1])
+        df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
     else:
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
 
