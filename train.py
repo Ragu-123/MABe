@@ -479,8 +479,9 @@ class BioPhysicsDataset(Dataset):
         raw_m1 = _fix_teleport(raw_m1)
         raw_m2 = _fix_teleport(raw_m2)
         
-        # 3. Features
-        feats = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+        # 3. Features (Compute for Agent AND Target)
+        feats_ag = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+        feats_tar = _geo_feats(raw_m2, raw_m1, conf['pix_cm'])
         
         # 4. Targets Setup
         if data_loaded:
@@ -559,7 +560,7 @@ class BioPhysicsDataset(Dataset):
             'behaviors_labeled': b_label
         }
 
-        return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
+        return torch.tensor(feats_ag), torch.tensor(feats_tar), target, weights, lab_idx, centerness, meta_info
 
     def __getitem__(self, idx):
         # Mix Action Windows (90%) and Random Valid Windows (10%)
@@ -572,8 +573,8 @@ class BioPhysicsDataset(Dataset):
     def __len__(self): return len(self.samples)
 
 def pad_collate_dual(batch):
-    gx, lx, t, w, lid, center, meta = zip(*batch)
-    return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
+    gx, tx, t, w, lid, center, meta = zip(*batch)
+    return torch.stack(gx), torch.stack(tx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
 
 # Module 2: The Morphological & Interaction Core.
 
@@ -1393,14 +1394,16 @@ def train_ethoswarm_v3():
             # Move items to GPU
             # New: c_tgt, meta
             batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
-            gx, lx, tgt, weights, lid, c_tgt, batch_meta = batch
+            gx, tx, tgt, weights, lid, c_tgt, batch_meta = batch
 
             # Ensure float32/contiguous
+            # gx: Global/Local Agent features (same window in training)
+            # tx: Global/Local Target features
             gx = gx.float().contiguous()
-            lx = lx.float().contiguous()
+            tx = tx.float().contiguous()
 
             # Safety Checks
-            if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
+            if not torch.isfinite(gx).all() or not torch.isfinite(tx).all():
                 # print(f"[WARN] Non-finite inputs in batch {i}, skipping")
                 continue
             if (weights.sum(dim=1) == 0).all():
@@ -1417,7 +1420,8 @@ def train_ethoswarm_v3():
                 # Mixed Precision Forward
                 with torch.cuda.amp.autocast():
                     # Forward returns 3 items
-                    probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid, role_idx)
+                    # Training uses same window for Global and Local
+                    probs, center_pred, aux_logits = model(gx, tx, gx, tx, lid, role_idx)
 
                     loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
 

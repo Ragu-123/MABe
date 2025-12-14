@@ -301,7 +301,8 @@ class BioPhysicsDataset(Dataset):
             raw_m2 = self._fix_teleport(raw_m2)
 
             # Feature Extraction
-            feats = self._geo_feats(raw_m1, raw_m2, pix_cm)
+            feats_ag = self._geo_feats(raw_m1, raw_m2, pix_cm)
+            feats_tar = self._geo_feats(raw_m2, raw_m1, pix_cm)
 
             # CRITICAL FIX: Use sorted keys to match load_lab_vocabulary
             # And fallback to DEFAULT if lab not found
@@ -318,11 +319,11 @@ class BioPhysicsDataset(Dataset):
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats), lab_idx, agent_id, target_id, frames, valid_frames, vid, active_tasks
+            return torch.tensor(feats_ag), torch.tensor(feats_tar), lab_idx, agent_id, target_id, frames, valid_frames, vid, active_tasks
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -715,25 +716,28 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats, lab_idx, agent_id, target_id, frames, valid_mask, vid, active_tasks = batch_data
+        feats_ag, feats_tar, lab_idx, agent_id, target_id, frames, valid_mask, vid, active_tasks = batch_data
 
-        if feats is None: continue
+        if feats_ag is None: continue
 
         # Prepare Tensors
-        T_total = len(feats)
+        T_total = len(feats_ag)
         prob_accum = torch.zeros((T_total, 37), device=DEVICE)
         count_accum = torch.zeros((T_total, 37), device=DEVICE)
 
         # REVISED STRATEGY FOR SPEED/ACCURACY
         # 1. Compute Global Embedding for entire video (subsampled)
-        g_feats_full = feats.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
+        # We need both Agent and Target full features
+        g_feats_ag_full = feats_ag.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
+        g_feats_tar_full = feats_tar.unsqueeze(0).to(DEVICE) # [1, T, 11, 16]
 
         # NOTE: Training uses gx=lx (local window).
         # Using subsampled global video here causes distribution shift.
         # We switch to gx=lx to match training distribution.
 
         # 2. Loop Windows for Local (Batched)
-        windows = []
+        windows_ag = []
+        windows_tar = []
         starts = []
 
         for start in range(0, T_total, STRIDE):
@@ -743,37 +747,47 @@ def run_inference():
             if not valid_mask[start:end].any():
                 continue
 
-            l_input = g_feats_full[:, start:end, :, :]
-            if l_input.shape[1] < WINDOW_SIZE:
-                 pad_n = WINDOW_SIZE - l_input.shape[1]
-                 l_input = F.pad(l_input, (0,0,0,0,0,pad_n))
+            l_input_ag = g_feats_ag_full[:, start:end, :, :]
+            l_input_tar = g_feats_tar_full[:, start:end, :, :]
 
-            windows.append(l_input)
+            if l_input_ag.shape[1] < WINDOW_SIZE:
+                 pad_n = WINDOW_SIZE - l_input_ag.shape[1]
+                 l_input_ag = F.pad(l_input_ag, (0,0,0,0,0,pad_n))
+                 l_input_tar = F.pad(l_input_tar, (0,0,0,0,0,pad_n))
+
+            windows_ag.append(l_input_ag)
+            windows_tar.append(l_input_tar)
             starts.append(start)
 
         # Process in Batches
         INF_BATCH_SIZE = 32
-        for i in range(0, len(windows), INF_BATCH_SIZE):
-            batch_windows = windows[i : i+INF_BATCH_SIZE]
+        for i in range(0, len(windows_ag), INF_BATCH_SIZE):
+            batch_windows_ag = windows_ag[i : i+INF_BATCH_SIZE]
+            batch_windows_tar = windows_tar[i : i+INF_BATCH_SIZE]
             batch_starts = starts[i : i+INF_BATCH_SIZE]
 
-            if not batch_windows: continue
+            if not batch_windows_ag: continue
 
             # Stack
-            lx_batch = torch.cat(batch_windows, dim=0) # [B, 256, 11, 16]
-            B = lx_batch.shape[0]
+            lx_ag_batch = torch.cat(batch_windows_ag, dim=0) # [B, 256, 11, 16]
+            lx_tar_batch = torch.cat(batch_windows_tar, dim=0)
+            B = lx_ag_batch.shape[0]
 
             # MATCH TRAINING: Global Input = Local Input
-            gx_batch = lx_batch
+            gx_ag_batch = lx_ag_batch
+            gx_tar_batch = lx_tar_batch
 
             lid_batch = torch.tensor([lab_idx]*B).to(DEVICE)
 
             # Safety: Handle NaNs in inputs
-            gx_batch = torch.nan_to_num(gx_batch, nan=0.0)
-            lx_batch = torch.nan_to_num(lx_batch, nan=0.0)
+            gx_ag_batch = torch.nan_to_num(gx_ag_batch, nan=0.0)
+            gx_tar_batch = torch.nan_to_num(gx_tar_batch, nan=0.0)
+            lx_ag_batch = torch.nan_to_num(lx_ag_batch, nan=0.0)
+            lx_tar_batch = torch.nan_to_num(lx_tar_batch, nan=0.0)
 
             with torch.no_grad():
-                probs, _, _ = model(gx_batch, gx_batch, lx_batch, lx_batch, lid_batch)
+                # Pass separate agent and target features
+                probs, _, _ = model(gx_ag_batch, gx_tar_batch, lx_ag_batch, lx_tar_batch, lid_batch)
 
             # Accumulate
             for b in range(B):
