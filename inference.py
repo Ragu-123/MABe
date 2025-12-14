@@ -758,16 +758,19 @@ def run_inference():
                 # frames[e-1] is the last included frame. +1 makes it exclusive.
                 real_stop = frames[e-1] + 1
 
-                # SELF BEHAVIOR FIX: Target must be Agent
-                final_target_id = target_id
+                # SELF BEHAVIOR FIX: Target must be 'self' (based on reference output)
+                # Kaggle metric expects 'self' string for self-behaviors, not the agent ID repeated.
+                final_target_id = normalize_id(target_id)
+                final_agent_id = normalize_id(agent_id)
+
                 if action_name in SELF_BEHAVIORS:
-                    final_target_id = agent_id
+                    final_target_id = "self"
 
                 submission_rows.append([
                         0,
                         vid,
-                        normalize_id(agent_id),
-                        normalize_id(final_target_id),
+                        final_agent_id,
+                        final_target_id,
                         action_name,
                         real_start,
                         real_stop
