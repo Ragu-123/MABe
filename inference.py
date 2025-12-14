@@ -12,6 +12,7 @@ import math
 import polars as pl
 import pyarrow.parquet as pq
 import ast
+import traceback # For debugging silent failures
 
 # ==============================================================================
 # 1. SHARED CONFIGURATION & DATA (Copied exactly from train.py)
@@ -157,6 +158,66 @@ class BioPhysicsDataset(Dataset):
         self.samples = filtered
         print(f"Retained {len(self.samples)} valid samples.")
 
+    def _parse_wide_format(self, df, agent_id, target_id, L_alloc):
+        """
+        Parses wide-format DataFrame (e.g. mouse1_ear_x) into (L, 11, 2) arrays.
+        Robustly handles 'mouse1' vs 'm1' naming conventions.
+        """
+        m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+        m2 = np.zeros_like(m1)
+
+        # Normalize column names to lowercase for safer matching
+        cols = [c.lower() for c in df.columns]
+
+        # Determine prefixes for agent and target
+        # agent_id is usually "1" or "mouse1" or "resident"
+        # We need to map to likely column prefixes
+        def get_prefixes(mid):
+            s = str(mid).lower().strip()
+            if s.isdigit():
+                return [f"mouse{s}", f"m{s}"]
+            if s.startswith("mouse"):
+                digit = s.replace("mouse", "")
+                return [s, f"m{digit}"]
+            return [s]
+
+        p_ag = get_prefixes(agent_id)
+        p_tar = get_prefixes(target_id)
+
+        # Helper to find column
+        def find_col(prefixes, bodypart, axis):
+            bp = bodypart.lower()
+            candidates = []
+            for p in prefixes:
+                candidates.append(f"{p}_{bp}_{axis}")
+                # Try without underscore between mouse and bp? usually there is one.
+
+            for cand in candidates:
+                if cand in cols:
+                    return df.columns[cols.index(cand)]
+            return None
+
+        # Fill Arrays
+        for idx, part in enumerate(BODY_PARTS):
+            # Mouse 1 (Agent)
+            col_x = find_col(p_ag, part, 'x')
+            col_y = find_col(p_ag, part, 'y')
+            if col_x and col_y:
+                # Handle potentially shorter df than L_alloc
+                L = min(len(df), L_alloc)
+                m1[:L, idx, 0] = df[col_x].values[:L]
+                m1[:L, idx, 1] = df[col_y].values[:L]
+
+            # Mouse 2 (Target)
+            col_x = find_col(p_tar, part, 'x')
+            col_y = find_col(p_tar, part, 'y')
+            if col_x and col_y:
+                L = min(len(df), L_alloc)
+                m2[:L, idx, 0] = df[col_x].values[:L]
+                m2[:L, idx, 1] = df[col_y].values[:L]
+
+        return m1, m2
+
     def _fix_teleport(self, pos):
         T, N, _ = pos.shape
         missing = (np.abs(pos).sum(axis=2) < 1e-6)
@@ -259,40 +320,50 @@ class BioPhysicsDataset(Dataset):
 
             L_alloc = int(max_frame) + 1
 
-            # 2. Fetch Data for this Pair
-            # Ensure mouse_id is string for filtering
-            df_full['mouse_id'] = df_full['mouse_id'].astype(str)
-            df = df_full[df_full['mouse_id'].isin([str(agent_id), str(target_id)])].copy()
+            # 2. Fetch Data
+            # Check format: Long (with mouse_id) vs Wide
+            if 'mouse_id' in df_full.columns:
+                # Long Format
+                df_full['mouse_id'] = df_full['mouse_id'].astype(str)
+                df = df_full[df_full['mouse_id'].isin([str(agent_id), str(target_id)])].copy()
 
-            if df.empty:
-                return None, None, None, None, None
+                if df.empty:
+                    return None, None, None, None, None, None, None, None
 
-            raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
-            raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+                raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
+                raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
 
-            # Validity Masks
-            valid_m1 = np.zeros(L_alloc, dtype=bool)
-            valid_m2 = np.zeros(L_alloc, dtype=bool)
+                # Validity Masks
+                valid_m1 = np.zeros(L_alloc, dtype=bool)
+                valid_m2 = np.zeros(L_alloc, dtype=bool)
 
-            # Mouse 1
-            d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
-            for i, bp in enumerate(BODY_PARTS):
-                rows = d1[d1['bodypart']==bp]
-                if not rows.empty:
-                    indices = rows['video_frame'].values
-                    valid = (indices >= 0) & (indices < L_alloc)
-                    raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
-                    valid_m1[indices[valid]] = True
+                # Mouse 1
+                d1 = df[df['mouse_id'].astype(str) == str(agent_id)]
+                for i, bp in enumerate(BODY_PARTS):
+                    rows = d1[d1['bodypart']==bp]
+                    if not rows.empty:
+                        indices = rows['video_frame'].values
+                        valid = (indices >= 0) & (indices < L_alloc)
+                        raw_m1[indices[valid], i] = rows[['x', 'y']].values[valid]
+                        valid_m1[indices[valid]] = True
 
-            # Mouse 2
-            d2 = df[df['mouse_id'].astype(str) == str(target_id)]
-            for i, bp in enumerate(BODY_PARTS):
-                rows = d2[d2['bodypart']==bp]
-                if not rows.empty:
-                    indices = rows['video_frame'].values
-                    valid = (indices >= 0) & (indices < L_alloc)
-                    raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
-                    valid_m2[indices[valid]] = True
+                # Mouse 2
+                d2 = df[df['mouse_id'].astype(str) == str(target_id)]
+                for i, bp in enumerate(BODY_PARTS):
+                    rows = d2[d2['bodypart']==bp]
+                    if not rows.empty:
+                        indices = rows['video_frame'].values
+                        valid = (indices >= 0) & (indices < L_alloc)
+                        raw_m2[indices[valid], i] = rows[['x', 'y']].values[valid]
+                        valid_m2[indices[valid]] = True
+            else:
+                # Wide Format (Hidden Test Set)
+                raw_m1, raw_m2 = self._parse_wide_format(df_full, str(agent_id), str(target_id), L_alloc)
+                # Assume valid where not 0? Or just set valid=True?
+                # _parse_wide_format returns 0s where missing.
+                # Compute valid masks based on non-zero
+                valid_m1 = (np.abs(raw_m1).sum(axis=(1,2)) > 1e-6)
+                valid_m2 = (np.abs(raw_m2).sum(axis=(1,2)) > 1e-6)
 
             # Intersection of presence
             valid_frames = valid_m1 & valid_m2
