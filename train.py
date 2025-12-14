@@ -503,7 +503,22 @@ class BioPhysicsDataset(Dataset):
 
                     if aid_col in adf.columns and tid_col in adf.columns:
                          # Filter with explicit string casting for robustness
-                         adf = adf[(adf[aid_col].astype(str) == str(agent_id)) & (adf[tid_col].astype(str) == str(target_id))]
+                         # CRITICAL FIX: Include Self-Behaviors where target == agent
+                         # The dataset description says self-behaviors have same agent and target ID.
+                         # Our sample generator creates pairs (A, B) where A != B.
+                         # If we only filter for target == target_id (B), we miss A's self-behaviors (where target == A).
+                         # We must include rows where target matches the sample target (pair behavior) OR the sample agent (self behavior).
+
+                         agent_str = str(agent_id)
+                         target_str = str(target_id)
+
+                         adf = adf[
+                             (adf[aid_col].astype(str) == agent_str) &
+                             (
+                                 (adf[tid_col].astype(str) == target_str) |
+                                 (adf[tid_col].astype(str) == agent_str)
+                             )
+                         ]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
