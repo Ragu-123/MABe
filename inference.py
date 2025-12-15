@@ -1077,7 +1077,8 @@ def run_inference():
             if len(ds.samples) > 0:
                 valid_vid = ds.samples[0]['video_id']
 
-        submission_rows.append([0, valid_vid, "mouse1", "mouse2", "sniff", 0, 1])
+        # Use duration > 2 to survive robustify() filter
+        submission_rows.append([0, valid_vid, "mouse1", "mouse2", "sniff", 0, 10])
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
     else:
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
