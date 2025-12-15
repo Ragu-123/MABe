@@ -129,14 +129,21 @@ class BioPhysicsDataset(Dataset):
 
             # Create permutations
 
-            # 1. Self Inference Samples (Agent, Agent)
-            # We process each agent once for self-behaviors
+            # 1. Self Inference Samples
+            # STRATEGY: Use a "Proxy Neighbor" (real target) to generate valid features (dist > 0)
+            # but ONLY predict self-behaviors. This matches training distribution.
             for agent in mice:
+                others = [m for m in mice if m != agent]
+                if others:
+                    target = others[0] # Pick first neighbor as proxy
+                else:
+                    target = agent # Fallback for single mouse (dist=0, OOD but unavoidable)
+
                 self.samples.append({
                     'video_id': vid,
                     'lab_id': lab,
                     'agent_id': str(agent),
-                    'target_id': str(agent), # Self as target
+                    'target_id': str(target),
                     'pix_cm': pix_cm,
                     'active_tasks': active_tasks,
                     'is_self': True
@@ -923,20 +930,19 @@ def run_inference():
             norm_agent = canonical_mouse_id(agent_id)
             norm_target = canonical_mouse_id(target_id)
 
-            # Identify valid actions for this pair
+            # Identify valid actions for this pass
             valid_actions = set()
             for (task_a, task_t, task_act) in active_tasks:
-                # Check for direct match
-                if task_a == norm_agent and task_t == norm_target:
-                    valid_actions.add(task_act)
-
-                # Check for Self behaviors (target might be 'self' or same agent)
-                if task_a == norm_agent and (task_t == "self" or task_t == task_a):
-                    # If this is a self behavior, does it apply here?
-                    # We are processing pair (A, B).
-                    # If A does "self", it is valid in this pair context?
-                    # Yes, my code outputs self behaviors.
-                    valid_actions.add(task_act)
+                # Mode-Aware Filtering
+                if is_self:
+                    # SELF MODE: Only accept tasks where target is "self" or same agent
+                    if task_a == norm_agent and (task_t == "self" or task_t == task_a):
+                        valid_actions.add(task_act)
+                else:
+                    # PAIR MODE: Only accept tasks where target matches neighbor
+                    # AND task is NOT a self-task (redundant check if metadata is clean, but safe)
+                    if task_a == norm_agent and task_t == norm_target:
+                        valid_actions.add(task_act)
 
             if valid_actions:
                 # Create mask
