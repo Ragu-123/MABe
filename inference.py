@@ -128,16 +128,33 @@ class BioPhysicsDataset(Dataset):
                 # If empty set, we DON'T filter. So we allow all. Correct.
 
             # Create permutations
+
+            # 1. Self Inference Samples (Agent, Agent)
+            # We process each agent once for self-behaviors
+            for agent in mice:
+                self.samples.append({
+                    'video_id': vid,
+                    'lab_id': lab,
+                    'agent_id': str(agent),
+                    'target_id': str(agent), # Self as target
+                    'pix_cm': pix_cm,
+                    'active_tasks': active_tasks,
+                    'is_self': True
+                })
+
+            # 2. Pair Inference Samples (Agent, Target) where A != T
+            # We process pairs only for pair-behaviors
             for agent in mice:
                 for target in mice:
                     if agent != target:
                         self.samples.append({
                             'video_id': vid,
                             'lab_id': lab,
-                            'agent_id': str(agent), # FORCE STRING
-                            'target_id': str(target), # FORCE STRING
+                            'agent_id': str(agent),
+                            'target_id': str(target),
                             'pix_cm': pix_cm,
-                            'active_tasks': active_tasks # Pass down
+                            'active_tasks': active_tasks,
+                            'is_self': False
                         })
 
         # --- Filter Bad Samples ---
@@ -307,6 +324,7 @@ class BioPhysicsDataset(Dataset):
         target_id = sample['target_id']
         pix_cm = sample['pix_cm']
         active_tasks = sample.get('active_tasks', set())
+        is_self = sample.get('is_self', False)
         # conf = LAB_CONFIGS.get(lab, LAB_CONFIGS['DEFAULT']) # Not needed for pix_cm anymore
 
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
@@ -399,11 +417,11 @@ class BioPhysicsDataset(Dataset):
             # Frames: Just indices since we don't have 'frame' column
             frames = np.arange(L_alloc)
 
-            return torch.tensor(feats_ag), torch.tensor(feats_tar), lab_idx, agent_id, target_id, frames, valid_frames, vid, active_tasks
+            return torch.tensor(feats_ag), torch.tensor(feats_tar), lab_idx, agent_id, target_id, frames, valid_frames, vid, active_tasks, is_self
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -800,7 +818,7 @@ def run_inference():
     print(f"Starting Inference on {len(ds)} samples...")
     for i, batch_data in enumerate(val_loader_full):
         # New Pair-Based Loader
-        feats_ag, feats_tar, lab_idx, agent_id, target_id, frames, valid_mask, vid, active_tasks = batch_data
+        feats_ag, feats_tar, lab_idx, agent_id, target_id, frames, valid_mask, vid, active_tasks, is_self = batch_data
 
         if feats_ag is None: continue
 
@@ -946,11 +964,41 @@ def run_inference():
         # Using per-class thresholds loaded from JSON
         # final_probs: [T, 37], thresholds: [37]
 
+        # SLICING LOGIC: Separate Self vs Pair inference based on sample type
+        # If is_self=True, we ONLY look at self_indices.
+        # If is_self=False, we ONLY look at pair_indices.
+
+        # Note: final_probs has 37 columns.
+        # We zero out columns that are invalid for this pass.
+
+        valid_indices_mask = torch.zeros(NUM_CLASSES).to(DEVICE)
+
+        if is_self:
+            # Only Self Behaviors
+            for idx in range(NUM_CLASSES):
+                if ACTION_LIST[idx] in SELF_BEHAVIORS:
+                    valid_indices_mask[idx] = 1.0
+        else:
+            # Only Pair Behaviors
+            for idx in range(NUM_CLASSES):
+                if ACTION_LIST[idx] in PAIR_BEHAVIORS:
+                    valid_indices_mask[idx] = 1.0
+
+        # Apply mask to probabilities (zeroing out invalid actions)
+        final_probs = final_probs * valid_indices_mask.unsqueeze(0)
+
         preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy() # [T, 37]
 
         # Generate Segments per Class
         for c in range(NUM_CLASSES):
             action_name = ACTION_LIST[c]
+
+            # Skip if this action is not relevant for the current pass
+            if is_self:
+                if action_name not in SELF_BEHAVIORS: continue
+            else:
+                if action_name not in PAIR_BEHAVIORS: continue
+
             binary_seq = preds[:, c]
 
             # Find contiguous segments
@@ -975,13 +1023,15 @@ def run_inference():
                 # frames[e-1] is the last included frame. +1 makes it exclusive.
                 real_stop = frames[e-1] + 1
 
-                # SELF BEHAVIOR FIX: Target must be 'self' (based on reference output)
-                # Kaggle metric expects 'self' string for self-behaviors, not the agent ID repeated.
-                final_target_id = normalize_id(target_id)
+                # ID Logic
                 final_agent_id = normalize_id(agent_id)
+                final_target_id = normalize_id(target_id)
 
-                if action_name in SELF_BEHAVIORS:
-                    final_target_id = final_agent_id # Reverted "self" to avoid potential Scorer KeyError
+                if is_self:
+                    final_target_id = "self" # STRICTLY "self" for self-inference pass
+                else:
+                    # Pair pass: target must NOT be self (guaranteed by loop)
+                    pass
 
                 submission_rows.append([
                         0,
