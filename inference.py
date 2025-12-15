@@ -953,6 +953,9 @@ def run_inference():
 
                 # Apply mask (broadcasting)
                 final_probs = final_probs * task_mask.unsqueeze(0)
+            else:
+                # Active tasks exist but none match this pair/mode -> Mask everything
+                final_probs = final_probs * 0.0
 
         # OPTIMIZATION: Temporal Smoothing (Reducing Flicker)
         # Simple Moving Average (window=5)
@@ -1088,6 +1091,21 @@ def run_inference():
         print("Running robustify to merge overlaps...")
         df_sub = robustify(df_sub, min_duration=2)
 
+        # SANITIZATION: Remove any invalid rows where target="self" BUT action is a Pair Behavior
+        # This can happen if logic leaked, and Kaggle rejects it instantly.
+        # We also enforce that Self Behaviors have target="self" (which is handled by loop logic, but safe to check)
+
+        # Identify Pair Actions
+        is_pair_act = df_sub['action'].isin(PAIR_BEHAVIORS)
+        is_self_target = df_sub['target_id'] == "self"
+
+        # Filter: Drop rows where (Action is Pair) AND (Target is Self)
+        # This combination is ILLEGAL in MABe schema
+        invalid_mask = is_pair_act & is_self_target
+        if invalid_mask.any():
+            print(f"Warning: Dropping {invalid_mask.sum()} invalid pair-action rows targeting 'self'.")
+            df_sub = df_sub[~invalid_mask]
+
         df_sub = df_sub.sort_values(['video_id', 'start_frame'])
         df_sub['row_id'] = np.arange(len(df_sub))
 
@@ -1095,12 +1113,29 @@ def run_inference():
         cols = ['row_id'] + [c for c in df_sub.columns if c != 'row_id']
         df_sub = df_sub[cols]
 
-        # FIX: Ensure video_id is int if possible, or consistent string
-        # Kaggle requires specific types. video_id is typically int in MABe.
+        # FIX: Ensure video_id is strictly integer
+        # Kaggle evaluator rejects string-quoted IDs.
+        # We attempt to clean and convert.
         try:
+            # Clean string artifacts if any (though usually clean from read_csv)
+            # Handle mixed types by converting to string first, then cleaning, then int
+            if df_sub['video_id'].dtype == object:
+                df_sub['video_id'] = df_sub['video_id'].astype(str).str.strip()
+
+            # Coerce to numeric, converting errors to NaN
+            df_sub['video_id'] = pd.to_numeric(df_sub['video_id'], errors='coerce')
+
+            # Drop rows with invalid video_id (safer than submitting object type)
+            if df_sub['video_id'].isna().any():
+                print(f"Warning: Dropping {df_sub['video_id'].isna().sum()} rows with invalid video_id")
+                df_sub = df_sub.dropna(subset=['video_id'])
+
+            # Cast to int64
             df_sub['video_id'] = df_sub['video_id'].astype(int)
-        except:
-            pass # Keep as string if not convertible (e.g. if test set has non-numeric IDs)
+        except Exception as e:
+            print(f"Error enforcing video_id integer type: {e}")
+            # If critical failure, we might submit as is, but it likely fails.
+            # But the dropna logic should handle non-ints.
 
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
