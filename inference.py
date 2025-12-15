@@ -105,9 +105,12 @@ class BioPhysicsDataset(Dataset):
             # Format: "[('mouse1','mouse2','sniff'), ...]"
             active_tasks = set()
             try:
+                # Robust parsing of behaviors_labeled
                 if 'behaviors_labeled' in row and pd.notna(row['behaviors_labeled']):
-                    b_str = row['behaviors_labeled']
-                    if b_str.strip().startswith("["):
+                    val = row['behaviors_labeled']
+                    # Ensure it is a string before checking/parsing
+                    b_str = str(val).strip()
+                    if b_str.startswith("["):
                         tasks = ast.literal_eval(b_str)
                         for t in tasks:
                             # t is (agent, target, action)
@@ -117,7 +120,12 @@ class BioPhysicsDataset(Dataset):
                             act = t[2]
                             active_tasks.add((a, tgt, act))
             except:
-                pass # Fallback to all
+                # If parsing fails, we assume no restriction or empty set?
+                # Usually better to fail open (allow all) or empty?
+                # If behaviors_labeled exists but is malformed, maybe we should ignore it.
+                pass # Fallback to empty set (which usually implies allow all logic later?)
+                # Wait, later logic: `if active_tasks: filter`.
+                # If empty set, we DON'T filter. So we allow all. Correct.
 
             # Create permutations
             for agent in mice:
@@ -304,7 +312,7 @@ class BioPhysicsDataset(Dataset):
         fpath = self.tracking_dir / lab / f"{vid}.parquet"
 
         if not fpath.exists():
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
         try:
             # SWITCH TO PANDAS to avoid Polars compatibility issues on Kaggle
@@ -312,11 +320,11 @@ class BioPhysicsDataset(Dataset):
 
             # 1. Get Limits
             if 'video_frame' not in df_full.columns:
-                 return None, None, None, None, None
+                 return None, None, None, None, None, None, None, None, None
 
             max_frame = df_full['video_frame'].max()
             if pd.isna(max_frame):
-                 return None, None, None, None, None, None
+                 return None, None, None, None, None, None, None, None, None
 
             L_alloc = int(max_frame) + 1
 
@@ -328,7 +336,7 @@ class BioPhysicsDataset(Dataset):
                 df = df_full[df_full['mouse_id'].isin([str(agent_id), str(target_id)])].copy()
 
                 if df.empty:
-                    return None, None, None, None, None, None, None, None
+                    return None, None, None, None, None, None, None, None, None
 
                 raw_m1 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
                 raw_m2 = np.zeros((L_alloc, 11, 2), dtype=np.float32)
@@ -395,7 +403,7 @@ class BioPhysicsDataset(Dataset):
 
         except Exception as e:
             print(f"Error loading {vid}: {e}")
-            return None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
     def __len__(self): return len(self.samples)
 
@@ -987,9 +995,15 @@ def run_inference():
         # Create Dummy Row with VALID VIDEO ID to avoid foreign key errors in metric
         print("Warning: No predictions generated. Creating dummy row.")
 
-        valid_vid = "0"
-        if len(ds.samples) > 0:
-            valid_vid = ds.samples[0]['video_id']
+        # Try to get a valid video ID from metadata file directly if possible
+        try:
+            test_meta = pd.read_csv(DATA_PATH + '/test.csv')
+            valid_vid = str(test_meta['video_id'].iloc[0])
+        except:
+            # Fallback to dataset sample if file read fails
+            valid_vid = "0"
+            if len(ds.samples) > 0:
+                valid_vid = ds.samples[0]['video_id']
 
         submission_rows.append([0, valid_vid, "mouse1", "mouse2", "sniff", 0, 1])
         df_sub = pd.DataFrame(submission_rows, columns=['row_id', 'video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
