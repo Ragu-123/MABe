@@ -1029,6 +1029,15 @@ def run_inference():
                 # frames[e-1] is the last included frame. +1 makes it exclusive.
                 real_stop = frames[e-1] + 1
 
+                # Safety: Ensure stop frame does not exceed video limits
+                # frames array length is L_alloc.
+                # max valid frame index is frames[-1] = L_alloc-1
+                # real_stop can be L_alloc (exclusive)
+                # But if frames are sparse?
+                # We trust frames[e-1] is the last actual frame index.
+                # Just ensure it is positive.
+                if real_stop <= real_start: continue
+
                 # ID Logic
                 final_agent_id = normalize_id(agent_id)
                 final_target_id = normalize_id(target_id)
@@ -1085,6 +1094,13 @@ def run_inference():
         # Ensure row_id is the first column as required by submission format
         cols = ['row_id'] + [c for c in df_sub.columns if c != 'row_id']
         df_sub = df_sub[cols]
+
+        # FIX: Ensure video_id is int if possible, or consistent string
+        # Kaggle requires specific types. video_id is typically int in MABe.
+        try:
+            df_sub['video_id'] = df_sub['video_id'].astype(int)
+        except:
+            pass # Keep as string if not convertible (e.g. if test set has non-numeric IDs)
 
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
