@@ -1082,6 +1082,10 @@ def run_inference():
         df_sub = df_sub.sort_values(['video_id', 'start_frame'])
         df_sub['row_id'] = np.arange(len(df_sub))
 
+        # Ensure row_id is the first column as required by submission format
+        cols = ['row_id'] + [c for c in df_sub.columns if c != 'row_id']
+        df_sub = df_sub[cols]
+
     df_sub.to_csv("submission.csv", index=False)
     print(f"Inference Complete. Saved {len(df_sub)} rows to submission.csv")
 
