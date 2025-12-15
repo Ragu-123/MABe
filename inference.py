@@ -715,10 +715,14 @@ def robustify(df, min_duration=2):
             # Filter short duration here or assume pre-filtered?
             # We filter again just in case
             if (e - s) >= min_duration:
-                new_rows.append([vid, ag, tar, act, s, e])
+                new_rows.append([vid, ag, tar, act, int(s), int(e)])
 
     # Reconstruct DF
     new_df = pd.DataFrame(new_rows, columns=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    # Ensure types to prevent scoring errors
+    if not new_df.empty:
+        new_df['start_frame'] = new_df['start_frame'].astype(int)
+        new_df['stop_frame'] = new_df['stop_frame'].astype(int)
     return new_df
 
 def run_inference():
@@ -977,7 +981,7 @@ def run_inference():
                 final_agent_id = normalize_id(agent_id)
 
                 if action_name in SELF_BEHAVIORS:
-                    final_target_id = "self"
+                    final_target_id = final_agent_id # Reverted "self" to avoid potential Scorer KeyError
 
                 submission_rows.append([
                         0,
