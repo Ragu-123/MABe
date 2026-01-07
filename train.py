@@ -479,8 +479,9 @@ class BioPhysicsDataset(Dataset):
         raw_m1 = _fix_teleport(raw_m1)
         raw_m2 = _fix_teleport(raw_m2)
         
-        # 3. Features
-        feats = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+        # 3. Features (Compute for Agent AND Target)
+        feats_ag = _geo_feats(raw_m1, raw_m2, conf['pix_cm'])
+        feats_tar = _geo_feats(raw_m2, raw_m1, conf['pix_cm'])
         
         # 4. Targets Setup
         if data_loaded:
@@ -503,7 +504,22 @@ class BioPhysicsDataset(Dataset):
 
                     if aid_col in adf.columns and tid_col in adf.columns:
                          # Filter with explicit string casting for robustness
-                         adf = adf[(adf[aid_col].astype(str) == str(agent_id)) & (adf[tid_col].astype(str) == str(target_id))]
+                         # CRITICAL FIX: Include Self-Behaviors where target == agent
+                         # The dataset description says self-behaviors have same agent and target ID.
+                         # Our sample generator creates pairs (A, B) where A != B.
+                         # If we only filter for target == target_id (B), we miss A's self-behaviors (where target == A).
+                         # We must include rows where target matches the sample target (pair behavior) OR the sample agent (self behavior).
+
+                         agent_str = str(agent_id)
+                         target_str = str(target_id)
+
+                         adf = adf[
+                             (adf[aid_col].astype(str) == agent_str) &
+                             (
+                                 (adf[tid_col].astype(str) == target_str) |
+                                 (adf[tid_col].astype(str) == agent_str)
+                             )
+                         ]
 
                     for _, row in adf.iterrows():
                         if row['action'] in ACTION_TO_IDX:
@@ -544,7 +560,7 @@ class BioPhysicsDataset(Dataset):
             'behaviors_labeled': b_label
         }
 
-        return torch.tensor(feats), torch.tensor(feats), target, weights, lab_idx, centerness, meta_info
+        return torch.tensor(feats_ag), torch.tensor(feats_tar), target, weights, lab_idx, centerness, meta_info
 
     def __getitem__(self, idx):
         # Mix Action Windows (90%) and Random Valid Windows (10%)
@@ -557,8 +573,8 @@ class BioPhysicsDataset(Dataset):
     def __len__(self): return len(self.samples)
 
 def pad_collate_dual(batch):
-    gx, lx, t, w, lid, center, meta = zip(*batch)
-    return torch.stack(gx), torch.stack(lx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
+    gx, tx, t, w, lid, center, meta = zip(*batch)
+    return torch.stack(gx), torch.stack(tx), torch.stack(t), torch.stack(w), torch.tensor(lid), torch.stack(center), meta
 
 # Module 2: The Morphological & Interaction Core.
 
@@ -1242,14 +1258,63 @@ class DualStreamMaskedFocalLoss(nn.Module):
 # ==============================================================================
 # THRESHOLD TUNER
 # ==============================================================================
-def find_optimal_thresholds(model, val_loader, device, vocab_mask):
-    print("Optimization: Tuning Per-Class Thresholds on Validation Set...")
-    model.eval()
+def optimize_thresholds(all_probs, all_targets):
+    """
+    Optimizes thresholds per class to maximize F1 score.
+    all_probs: List of numpy arrays [T, 37]
+    all_targets: List of numpy arrays [T, 37]
+    """
+    print("Concatenating validation results for tuning...")
+    try:
+        y_pred = np.concatenate(all_probs, axis=0)
+        y_true = np.concatenate(all_targets, axis=0)
+    except ValueError:
+        print("Warning: No validation data found. Returning default thresholds.")
+        return [0.4] * 37
 
-    # We must modify this to work with the new validation structure (no val_loader)
-    # OR, we just skip it for now or implement a mini-loader.
-    # Given the complexity, let's just return defaults for now.
-    return torch.ones(37) * 0.4
+    num_classes = y_pred.shape[1]
+    best_thresholds = [0.4] * num_classes
+    threshold_range = np.arange(0.1, 0.95, 0.05)
+
+    print("Tuning thresholds per class...")
+    for c in range(num_classes):
+        # Optimization: Check if ground truth has any positives
+        # If no positives in GT, F1 is always 0. We should pick a conservative threshold
+        # or leave default.
+        if np.sum(y_true[:, c]) == 0:
+            best_thresholds[c] = 0.4 # Default
+            continue
+
+        best_f1 = -1.0
+        best_th = 0.4
+
+        # Optimization: Calculate F1 for all thresholds
+        scores = y_pred[:, c]
+        targets = y_true[:, c]
+
+        for th in threshold_range:
+            # Binary predictions
+            preds = (scores > th)
+
+            # Counts
+            tp = np.sum(preds & (targets == 1))
+            fp = np.sum(preds & (targets == 0))
+            fn = np.sum((~preds) & (targets == 1))
+
+            denom = 2*tp + fp + fn
+            if denom == 0:
+                f1 = 0.0
+            else:
+                f1 = 2*tp / denom
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+
+        best_thresholds[c] = float(best_th)
+        # print(f"Class {c}: Best Thresh={best_th:.2f}, F1={best_f1:.4f}")
+
+    return best_thresholds
 
 # ==============================================================================
 # TRAINING CONTROLLER
@@ -1329,14 +1394,16 @@ def train_ethoswarm_v3():
             # Move items to GPU
             # New: c_tgt, meta
             batch = [b.to(DEVICE) if isinstance(b, torch.Tensor) else b for b in batch]
-            gx, lx, tgt, weights, lid, c_tgt, batch_meta = batch
+            gx, tx, tgt, weights, lid, c_tgt, batch_meta = batch
 
             # Ensure float32/contiguous
+            # gx: Global/Local Agent features (same window in training)
+            # tx: Global/Local Target features
             gx = gx.float().contiguous()
-            lx = lx.float().contiguous()
+            tx = tx.float().contiguous()
 
             # Safety Checks
-            if not torch.isfinite(gx).all() or not torch.isfinite(lx).all():
+            if not torch.isfinite(gx).all() or not torch.isfinite(tx).all():
                 # print(f"[WARN] Non-finite inputs in batch {i}, skipping")
                 continue
             if (weights.sum(dim=1) == 0).all():
@@ -1353,7 +1420,8 @@ def train_ethoswarm_v3():
                 # Mixed Precision Forward
                 with torch.cuda.amp.autocast():
                     # Forward returns 3 items
-                    probs, center_pred, aux_logits = model(gx, gx, lx, lx, lid, role_idx)
+                    # Training uses same window for Global and Local
+                    probs, center_pred, aux_logits = model(gx, tx, gx, tx, lid, role_idx)
 
                     loss = loss_fn(probs, center_pred, aux_logits, tgt, c_tgt, weights, lab_masks[lid])
 
@@ -1388,6 +1456,11 @@ def train_ethoswarm_v3():
         submission_rows = []
         solution_rows = []
 
+        # Lists for Threshold Optimization
+        all_val_probs = []
+        all_val_targets = []
+        all_val_meta = [] # Store (vid, agent, target) for reconstruction
+
         # INFERENCE-STYLE VALIDATION LOOP (Optimized)
         print("Running Optimized Inference-Style Validation...")
 
@@ -1399,7 +1472,7 @@ def train_ethoswarm_v3():
 
         WINDOW_SIZE = 256
         STRIDE = 128
-        thresholds = torch.ones(37).to(DEVICE) * 0.4
+        # thresholds will be tuned later
 
         tracking_root = Path(DATA_PATH) / "train_tracking"
         annot_root = Path(DATA_PATH) / "train_annotation"
@@ -1458,6 +1531,7 @@ def train_ethoswarm_v3():
                         if str(aid_val) == agent_id and str(tid_val) == target_id:
                             pair_adf.append(a_row)
 
+                # Store Solution Rows for later Metric calculation
                 for a_row in pair_adf:
                     solution_rows.append({
                         'video_id': vid,
@@ -1554,27 +1628,71 @@ def train_ethoswarm_v3():
                         count_accum[start:end] += 1.0
 
                 final_probs = prob_accum / (count_accum + 1e-6)
-                preds = (final_probs > thresholds.unsqueeze(0)).int().cpu().numpy()
 
-                # Segments
-                for c in range(NUM_CLASSES):
-                    action_name = ACTION_LIST[c]
-                    binary_seq = preds[:, c]
-                    diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
-                    starts_seg = np.where(diffs == 1)[0]
-                    stops_seg = np.where(diffs == -1)[0]
+                # STORE PROBS FOR OPTIMIZATION
+                all_val_probs.append(final_probs.cpu().numpy())
+                all_val_meta.append((vid, agent_id, target_id))
 
-                    for s, e in zip(starts_seg, stops_seg):
-                        submission_rows.append({
-                             'video_id': vid,
-                             'agent_id': agent_id,
-                             'target_id': target_id,
-                             'action': action_name,
-                             'start_frame': s,
-                             'stop_frame': e-1
-                        })
+                # BUILD TARGET MASK
+                target_mask = np.zeros((T_total, NUM_CLASSES), dtype=np.float32)
+                for a_row in pair_adf:
+                     s, e = a_row['start_frame'], a_row['stop_frame']
+                     if s < T_total:
+                         e = min(e, T_total)
+                         # Assuming non-overlapping actions per class or overwriting is fine
+                         c_idx = ACTION_TO_IDX[a_row['action']]
+                         target_mask[s:e, c_idx] = 1.0
+                all_val_targets.append(target_mask)
 
                 batches += 1
+
+        # --- OPTIMIZE THRESHOLDS ---
+        best_thresholds = optimize_thresholds(all_val_probs, all_val_targets)
+
+        # Save Thresholds
+        thresh_path = f"ethoswarm_thresholds_ep{epoch+1}.json"
+        with open(thresh_path, 'w') as f:
+            json.dump(best_thresholds, f)
+        print(f"Saved optimized thresholds to {thresh_path}")
+
+        # --- GENERATE SUBMISSION WITH OPTIMIZED THRESHOLDS ---
+        print("Generating submission rows with optimized thresholds...")
+        final_thresholds = np.array(best_thresholds)
+
+        for i, (final_probs_np) in enumerate(all_val_probs):
+             vid, agent_id, target_id = all_val_meta[i]
+
+             # Apply Lab Masking logic before thresholding
+             # We need to recover lab_idx. We can get it from metadata if we stored it, or look it up.
+             # Ideally we should have stored lab_idx in all_val_meta.
+             # Re-lookup lab_id from video_id
+             row = meta[meta['video_id'].astype(str) == vid].iloc[0]
+             lab = row['lab_id']
+             lab_idx = list(LAB_CONFIGS.keys()).index(lab) if lab in LAB_CONFIGS else 0
+
+             if lab_idx < len(lab_masks):
+                  mask = lab_masks[lab_idx].cpu().numpy()
+                  final_probs_np = final_probs_np * mask
+
+             preds = (final_probs_np > final_thresholds).astype(int)
+
+             # Segments
+             for c in range(NUM_CLASSES):
+                action_name = ACTION_LIST[c]
+                binary_seq = preds[:, c]
+                diffs = np.diff(np.concatenate(([0], binary_seq, [0])))
+                starts_seg = np.where(diffs == 1)[0]
+                stops_seg = np.where(diffs == -1)[0]
+
+                for s, e in zip(starts_seg, stops_seg):
+                    submission_rows.append({
+                            'video_id': vid,
+                            'agent_id': agent_id,
+                            'target_id': target_id,
+                            'action': action_name,
+                            'start_frame': s,
+                            'stop_frame': e # Exclusive stop (fixed)
+                    })
 
         # CALCULATE METRIC
         try:
